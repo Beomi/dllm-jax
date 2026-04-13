@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dllm-jax"
+version = "0.1.0"
+description = "JAX backend for dLLM (Diffusion Language Modeling) — no PyTorch/CUDA required"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "jax>=0.4.20",
+    "flax>=0.10.0",
+    "orbax-checkpoint",
+    "gcsfs<=2026.2.0",
+    "optax>=0.2.0",
+    "numpy",
+    "transformers>=4.40.0",
+    "safetensors",
+    "huggingface_hub",
+    "datasets",
+]
+
+[project.optional-dependencies]
+tpu = [
+    "jax[tpu]>=0.4.20",
+]
+dev = [
+    "pytest",
+]
