@@ -169,6 +169,8 @@ HF_CHECKPOINT_TOKEN = (
     or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 )
+RESUME_DIR = os.environ.get("RESUME_DIR") or os.environ.get("RESUME_FROM")
+RESUME_STEP = int(os.environ.get("RESUME_STEP", "0"))  # 0 = latest available
 
 if WANDB_LOG and WANDB_MODE != "offline" and proc == 0:
     has_wandb_auth = bool(os.environ.get("WANDB_API_KEY")) or Path.home().joinpath(".netrc").exists()
@@ -212,6 +214,8 @@ if WANDB_LOG and proc == 0:
             "checkpoint_dir": CHECKPOINT_DIR,
             "checkpoint_keep": CHECKPOINT_KEEP,
             "checkpoint_on_finish": CHECKPOINT_ON_FINISH,
+            "resume_dir": RESUME_DIR,
+            "resume_step": RESUME_STEP,
             "hf_checkpoint_repo": HF_CHECKPOINT_REPO,
             "hf_checkpoint_path": HF_CHECKPOINT_PATH,
         },
@@ -550,6 +554,8 @@ if proc == 0:
             print(f"  checkpoint region={TPU_REGION} zone={TPU_ZONE}")
         if HF_CHECKPOINT_REPO and not CHECKPOINT_DIR_IS_GCS:
             print(f"  checkpoint hub repo={HF_CHECKPOINT_REPO} path={HF_CHECKPOINT_PATH}")
+    if RESUME_DIR:
+        print(f"  RESUME from {RESUME_DIR}" + (f" step={RESUME_STEP}" if RESUME_STEP > 0 else " (latest)"))
     print(f"{'='*70}", flush=True)
 
 rng = jax.random.key(42)
@@ -896,12 +902,187 @@ def run_training_step(global_step: int, epoch: int, epoch_step: int, total_steps
     save_training_checkpoint(global_step, epoch, epoch_step)
     return True
 
-global_step = 0
+# ── Resume from checkpoint ────────────────────────────────
+resumed_step = 0
+resumed_epoch = 0
+resumed_epoch_step = 0
+if RESUME_DIR:
+    resume_is_gcs = RESUME_DIR.startswith("gs://")
+
+    # Find the checkpoint step to restore
+    resume_step = RESUME_STEP
+    if resume_step <= 0 and resume_is_gcs:
+        # List checkpoint_N subdirs via google.cloud.storage (gfile unavailable on TPU VMs)
+        import re
+        from google.cloud import storage as gcs_storage
+        bucket_name = RESUME_DIR.replace("gs://", "").split("/", 1)[0]
+        prefix = RESUME_DIR.replace("gs://", "").split("/", 1)[1].rstrip("/") + "/"
+        client = gcs_storage.Client()
+        blobs = client.list_blobs(bucket_name, prefix=prefix, delimiter="/")
+        _ = list(blobs)  # consume iterator to populate prefixes
+        steps = []
+        for p in blobs.prefixes:
+            m = re.search(r"checkpoint_(\d+)/?$", p)
+            if m:
+                steps.append(int(m.group(1)))
+        if steps:
+            resume_step = max(steps)
+        if proc == 0:
+            print(f"[Worker {proc}] Found checkpoint steps: {sorted(steps)}, picking {resume_step}", flush=True)
+    elif resume_step <= 0:
+        # Local: find latest checkpoint_N dir
+        import re
+        ckpt_base = Path(RESUME_DIR)
+        steps = []
+        for d in ckpt_base.iterdir():
+            m = re.match(r"checkpoint_(\d+)$", d.name)
+            if m and d.is_dir():
+                steps.append(int(m.group(1)))
+        if steps:
+            resume_step = max(steps)
+
+    if resume_step <= 0:
+        raise RuntimeError(f"RESUME_DIR={RESUME_DIR} specified but no checkpoints found")
+
+    ckpt_path = RESUME_DIR.rstrip("/") + f"/checkpoint_{resume_step}"
+    if proc == 0:
+        print(f"[Worker {proc}] Restoring checkpoint: {ckpt_path}", flush=True)
+
+    _resume_rng_placeholder = np.asarray(jax.random.key_data(jax.random.key(0)))
+    restore_target = {
+        "model": nnx.state(model),
+        "optimizer": nnx.state(optimizer),
+        "global_step": np.asarray(0, dtype=np.int64),
+        "epoch": np.asarray(0, dtype=np.int32),
+        "epoch_step": np.asarray(0, dtype=np.int64),
+        "total_tokens": np.asarray(0, dtype=np.int64),
+        "rng": _resume_rng_placeholder,
+    }
+
+    # Use orbax directly for GCS restore (flax's restore_checkpoint can't list GCS dirs)
+    resume_ckpt = make_orbax_checkpointer()
+    if proc == 0:
+        print(f"[Worker {proc}] Starting orbax restore...", flush=True)
+    with orbax_set_mesh_context_patch():
+        restored = resume_ckpt.restore(ckpt_path, target=restore_target)
+    if proc == 0:
+        print(f"[Worker {proc}] Orbax restore done, re-sharding...", flush=True)
+
+    # Re-shard restored state to the 2D mesh. Orbax restores to multi-host
+    # arrays that may span non-addressable devices (so jax.device_get fails),
+    # or it places scalars on a single device. fsdp_tp_sharding() uses
+    # make_array_from_callback which requires a local numpy input and won't
+    # work for either case. Use jax.device_put with a NamedSharding instead —
+    # it handles already-placed multi-host arrays via resharding on device.
+    def _target_sharding(shape):
+        if len(shape) >= 2 and shape[0] >= 8 and shape[1] >= 8:
+            return NamedSharding(mesh, P("fsdp", "tp"))
+        if len(shape) == 1 and shape[0] >= 8:
+            return NamedSharding(mesh, P("tp"))
+        return NamedSharding(mesh, P())
+
+    # Cache identity-jits by sharding so we don't re-compile per leaf.
+    _reshard_jit_cache: dict = {}
+
+    def _reshard_via_jit(x: jax.Array, sharding):
+        fn = _reshard_jit_cache.get(sharding)
+        if fn is None:
+            fn = jax.jit(lambda a: a, out_shardings=sharding)
+            _reshard_jit_cache[sharding] = fn
+        return fn(x)
+
+    from jax.experimental import multihost_utils as _mhu
+
+    def _reshard(x):
+        if isinstance(x, jax.Array):
+            target = _target_sharding(x.shape)
+            # If the array spans all global devices, an identity-jit reshard works.
+            # Orbax often places scalars on a single device (non-addressable on
+            # most hosts), which identity-jit rejects. Fall back to a multi-host
+            # allgather: gather to every host as numpy, then device_put replicated.
+            x_devs = set(x.devices())
+            global_devs = set(mesh.devices.flat)
+            if x_devs >= global_devs:
+                return _reshard_via_jit(x, target)
+            # Single-device or partial: allgather to numpy on all hosts
+            host_val = np.asarray(_mhu.process_allgather(x, tiled=False))
+            # process_allgather stacks along a new leading axis — pick the first
+            # copy since the value is identical across the single-device placement.
+            if host_val.ndim > x.ndim:
+                host_val = host_val[0]
+            return jax.device_put(host_val, target)
+        if isinstance(x, (np.ndarray, jnp.ndarray)):
+            return jax.device_put(np.asarray(x), _target_sharding(x.shape))
+        return x
+
+    def reshard_tree(tree, label: str):
+        print(f"[Worker {proc}] Flattening {label} state...", flush=True)
+        leaves, treedef = jax.tree_util.tree_flatten(
+            tree,
+            is_leaf=lambda x: isinstance(x, (jax.Array, jnp.ndarray, np.ndarray)),
+        )
+        print(f"[Worker {proc}] Flattened {label} state: {len(leaves)} leaves", flush=True)
+        out = []
+        for i, leaf in enumerate(leaves, start=1):
+            should_log = i == 1 or i % 400 == 0 or i == len(leaves)
+            if should_log:
+                shape = getattr(leaf, "shape", None)
+                dtype = getattr(leaf, "dtype", None)
+                print(f"[Worker {proc}] Resharding {label}: leaf {i}/{len(leaves)} shape={shape} dtype={dtype}", flush=True)
+            out.append(_reshard(leaf))
+            if should_log:
+                print(f"[Worker {proc}] Resharded {label}: leaf {i}/{len(leaves)}", flush=True)
+        return jax.tree_util.tree_unflatten(treedef, out)
+
+    gdef, _ = nnx.split(model)
+    restored_model_state = reshard_tree(restored["model"], "resume-model")
+    model = nnx.merge(gdef, restored_model_state)
+
+    opt_gdef, _ = nnx.split(optimizer)
+    restored_opt_state = reshard_tree(restored["optimizer"], "resume-optimizer")
+    optimizer = nnx.merge(opt_gdef, restored_opt_state)
+    model = optimizer.model  # rebind after merge
+
+    resumed_step = int(restored["global_step"])
+    resumed_epoch = int(restored["epoch"])
+    resumed_epoch_step = int(restored["epoch_step"])
+    total_tokens = int(restored["total_tokens"])
+    rng = jax.random.wrap_key_data(restored["rng"])
+
+    del restored, restore_target, _resume_rng_placeholder
+    gc.collect()
+
+    if proc == 0:
+        print(f"[Worker {proc}] Resumed: step={resumed_step} epoch={resumed_epoch} "
+              f"epoch_step={resumed_epoch_step} tokens={total_tokens:,}", flush=True)
+    if resumed_step <= 0:
+        raise RuntimeError(f"Checkpoint restore returned step=0, expected step={resume_step}")
+    sync_all("resume-complete")
+
+global_step = resumed_step
 if RUN_FULL_EPOCHS:
-    for epoch in range(1, NUM_EPOCHS + 1):
+    start_epoch = max(1, resumed_epoch) if resumed_step > 0 else 1
+    for epoch in range(start_epoch, NUM_EPOCHS + 1):
         ds_iter = None if SYNTHETIC_DATA else make_dataset_iter()
         token_buffer = []
         epoch_step = 0
+        # On the resumed epoch, fast-forward the data pipeline past batches
+        # already consumed before the checkpoint so we don't retrain on them.
+        if epoch == resumed_epoch and resumed_epoch_step > 0 and not SYNTHETIC_DATA:
+            if proc == 0:
+                print(f"[Worker {proc}] Fast-forwarding dataset by {resumed_epoch_step} batches...", flush=True)
+            t_skip = time.time()
+            skipped = 0
+            for _ in range(resumed_epoch_step):
+                if get_batch() is None:
+                    break
+                skipped += 1
+                if proc == 0 and (skipped % 200 == 0 or skipped == resumed_epoch_step):
+                    print(f"[Worker {proc}] Fast-forward {skipped}/{resumed_epoch_step} ({time.time()-t_skip:.1f}s)", flush=True)
+            epoch_step = skipped
+            if proc == 0:
+                print(f"[Worker {proc}] Fast-forward done: skipped {skipped} batches in {time.time()-t_skip:.1f}s", flush=True)
+            sync_all("fast-forward-done")
         while True:
             global_step += 1
             epoch_step += 1
@@ -912,7 +1093,7 @@ if RUN_FULL_EPOCHS:
         if proc == 0:
             print(f"[Worker {proc}] Finished epoch {epoch}/{NUM_EPOCHS} after {epoch_step - 1} steps", flush=True)
 else:
-    for step in range(1, NUM_STEPS + 1):
+    for step in range(resumed_step + 1, NUM_STEPS + 1):
         global_step = step
         if not run_training_step(global_step, epoch=0, epoch_step=step, total_steps=NUM_STEPS):
             break
