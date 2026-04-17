@@ -14,19 +14,40 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
+def load_dotenv(path: str = ".env") -> None:
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip().strip('"').strip("'")
+        os.environ[key] = value
+
+
+load_dotenv()
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["LIBTPU_INIT_ARGS"] = " ".join([
-    "--xla_tpu_enable_async_collective_fusion=true",
-    "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true",
-    "--xla_tpu_overlap_compute_collective_tc=true",
-    "--xla_enable_async_all_gather=true",
-    "--xla_tpu_data_parallel_opt_different_sized_ops=true",
-])
+if os.environ.get("DLLM_DISABLE_LIBTPU_TUNING", "").lower() not in {"1", "true", "yes", "on"}:
+    os.environ["LIBTPU_INIT_ARGS"] = " ".join([
+        "--xla_tpu_enable_async_collective_fusion=true",
+        "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true",
+        "--xla_tpu_overlap_compute_collective_tc=true",
+        "--xla_enable_async_all_gather=true",
+        "--xla_tpu_data_parallel_opt_different_sized_ops=true",
+    ])
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import flax as _flax_pkg
 import transformers
 from flax import nnx
 from flax.training import checkpoints
@@ -46,6 +67,8 @@ from dllm_jax import (
     model_spec_from_config,
 )
 from dllm_jax import models as dllm_models
+
+_FLAX_NEW_OPTIMIZER_API = tuple(int(x) for x in _flax_pkg.__version__.split(".")[:2]) >= (0, 11)
 
 try:
     import orbax.checkpoint as ocp
@@ -137,6 +160,7 @@ WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME")
 WANDB_MODE = os.environ.get("WANDB_MODE", "online")
 PEAK_TFLOPS_PER_CHIP = float(os.environ.get("PEAK_TFLOPS_PER_CHIP", "918"))
 CHECKPOINT_STEPS = int(os.environ.get("CHECKPOINT_STEPS", os.environ.get("SAVE_STEPS", "500")))
+CHECKPOINT_SECONDS = int(os.environ.get("CHECKPOINT_SECONDS", "0"))
 TPU_ZONE = detect_tpu_zone()
 TPU_REGION = os.environ.get("TPU_REGION") or os.environ.get("REGION") or region_from_zone(TPU_ZONE)
 CHECKPOINT_BUCKET_PREFIX = os.environ.get("CHECKPOINT_BUCKET_PREFIX", "dllm-jax")
@@ -171,6 +195,12 @@ HF_CHECKPOINT_TOKEN = (
 )
 RESUME_DIR = os.environ.get("RESUME_DIR") or os.environ.get("RESUME_FROM")
 RESUME_STEP = int(os.environ.get("RESUME_STEP", "0"))  # 0 = latest available
+# ── DMax / OPUT (Chen et al., arXiv 2604.08302) ──────────────────────────────
+DMAX_ENABLE = env_flag("DMAX_ENABLE", False)
+DMAX_ON_POLICY_RATIO = float(os.environ.get("DMAX_ON_POLICY_RATIO", "0.5"))
+DMAX_NOISE_LOW = float(os.environ.get("DMAX_NOISE_LOW", "0.75"))
+DMAX_NOISE_HIGH = float(os.environ.get("DMAX_NOISE_HIGH", "0.75"))
+DMAX_BLOCK_SIZE = int(os.environ.get("DMAX_BLOCK_SIZE", "32"))
 
 if WANDB_LOG and WANDB_MODE != "offline" and proc == 0:
     has_wandb_auth = bool(os.environ.get("WANDB_API_KEY")) or Path.home().joinpath(".netrc").exists()
@@ -211,6 +241,7 @@ if WANDB_LOG and proc == 0:
             "tpu_region": TPU_REGION,
             "checkpoint_bucket": CHECKPOINT_BUCKET,
             "checkpoint_steps": CHECKPOINT_STEPS,
+            "checkpoint_seconds": CHECKPOINT_SECONDS,
             "checkpoint_dir": CHECKPOINT_DIR,
             "checkpoint_keep": CHECKPOINT_KEEP,
             "checkpoint_on_finish": CHECKPOINT_ON_FINISH,
@@ -218,6 +249,11 @@ if WANDB_LOG and proc == 0:
             "resume_step": RESUME_STEP,
             "hf_checkpoint_repo": HF_CHECKPOINT_REPO,
             "hf_checkpoint_path": HF_CHECKPOINT_PATH,
+            "dmax_enable": DMAX_ENABLE,
+            "dmax_on_policy_ratio": DMAX_ON_POLICY_RATIO,
+            "dmax_noise_low": DMAX_NOISE_LOW,
+            "dmax_noise_high": DMAX_NOISE_HIGH,
+            "dmax_block_size": DMAX_BLOCK_SIZE,
         },
     )
 
@@ -327,8 +363,11 @@ if proc == 0:
 # ── Per-layer remat ────────────────────────────────────────
 remat_policy = jax.checkpoint_policies.nothing_saveable
 
-def _remat_hidden_for_heads(self, input_ids, *, attention_mask=None, position_ids=None):
-    hidden_states = self.embed_tokens(input_ids)
+def _remat_hidden_for_heads(self, input_ids=None, *, inputs_embeds=None, attention_mask=None, position_ids=None):
+    if inputs_embeds is not None:
+        hidden_states = inputs_embeds
+    else:
+        hidden_states = self.embed_tokens(input_ids)
     if position_ids is None:
         position_ids = jnp.broadcast_to(
             jnp.arange(hidden_states.shape[1])[None, :],
@@ -342,6 +381,18 @@ def _remat_hidden_for_heads(self, input_ids, *, attention_mask=None, position_id
     return self.norm(hidden_states)
 
 GenericDecoderLM.hidden_for_heads = _remat_hidden_for_heads
+
+def create_block_diffusion_attention_mask(seq_len: int, block_size: int) -> jnp.ndarray:
+    q_idx = jnp.arange(seq_len * 2)[:, None]
+    kv_idx = jnp.arange(seq_len * 2)[None, :]
+    x0_q = q_idx >= seq_len
+    x0_kv = kv_idx >= seq_len
+    block_q = jnp.where(x0_q, (q_idx - seq_len) // block_size, q_idx // block_size)
+    block_kv = jnp.where(x0_kv, (kv_idx - seq_len) // block_size, kv_idx // block_size)
+    block_diagonal = (block_q == block_kv) & (x0_q == x0_kv)
+    offset_block_causal = (block_q > block_kv) & x0_kv & (~x0_q)
+    block_causal = (block_q >= block_kv) & x0_kv & x0_q
+    return block_diagonal | offset_block_causal | block_causal
 
 # ── CPU init, then shard to TPU ────────────────────────────
 print(f"[Worker {proc}] Building model on CPU...", flush=True)
@@ -518,17 +569,64 @@ def get_batch():
 
 # ── Loss + step ─────────────────────────────────────────────
 def loss_fn(mdl, batch):
-    out = mdl(batch["model_input_ids"], attention_mask=batch.get("attention_mask"))
-    nll = optax.softmax_cross_entropy_with_integer_labels(out["logits"], batch["input_ids"])
-    nll = nll * batch["loss_weights"] * batch["masked_mask"].astype(nll.dtype)
-    nll = nll / jnp.clip(batch["maskable_mask"].sum(), min=1)
+    model_input_ids = batch["model_input_ids"]
+    masked_mask = batch["masked_mask"]
+    maskable_mask = batch["maskable_mask"]
+
+    # DMax on-policy rollout: for examples flagged by on_policy_flag, replace
+    # MASK tokens in the noisy half with the model's own greedy predictions
+    # (stop_gradient) before the supervised forward.
+    if "on_policy_flag" in batch and batch["on_policy_flag"] is not None:
+        seq_len = batch["input_ids"].shape[1]
+        flag = batch["on_policy_flag"][:, None]  # [B, 1]
+        rollout_logits = jax.lax.stop_gradient(
+            mdl(
+                model_input_ids,
+                attention_mask=batch.get("attention_mask"),
+                position_ids=batch.get("position_ids"),
+            )["logits"]
+        )
+        semi_ids = jnp.argmax(rollout_logits, axis=-1)[:, :seq_len]
+        noised_ids = jnp.where(masked_mask & flag, semi_ids, model_input_ids[:, :seq_len])
+        model_input_ids = jnp.concatenate([noised_ids, model_input_ids[:, seq_len:]], axis=1)
+
+    out = mdl(
+        model_input_ids,
+        attention_mask=batch.get("attention_mask"),
+        position_ids=batch.get("position_ids"),
+    )
+    logits = out["logits"][:, : batch["input_ids"].shape[1]] if batch.get("on_policy_flag") is not None else out["logits"]
+    loss_mask = maskable_mask if batch.get("on_policy_flag") is not None else masked_mask
+    nll = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), batch["input_ids"])
+    nll = nll * batch["loss_weights"] * loss_mask.astype(nll.dtype)
+    nll = nll / jnp.clip(maskable_mask.sum(), min=1)
     loss = nll.sum()
     return loss, {"loss": loss}
+
+def grad_nonfinite_count(tree):
+    total = jnp.asarray(0.0, dtype=jnp.float32)
+    for leaf in jax.tree_util.tree_leaves(tree):
+        if isinstance(leaf, (jax.Array, jnp.ndarray)) and jnp.issubdtype(leaf.dtype, jnp.inexact):
+            total = total + jnp.sum((~jnp.isfinite(leaf)).astype(jnp.float32))
+    return total
+
+def sanitize_gradients(tree):
+    def sanitize_leaf(leaf):
+        if isinstance(leaf, (jax.Array, jnp.ndarray)) and jnp.issubdtype(leaf.dtype, jnp.inexact):
+            return jnp.where(jnp.isfinite(leaf), leaf, jnp.zeros_like(leaf))
+        return leaf
+    return jax.tree_util.tree_map(sanitize_leaf, tree)
 
 @nnx.jit
 def train_step(mdl, opt, batch):
     (_, m), g = nnx.value_and_grad(lambda m: loss_fn(m, batch), has_aux=True)(mdl)
-    opt.update(g)
+    m["grad_nonfinite_count"] = grad_nonfinite_count(g)
+    g = sanitize_gradients(g)
+    m["grad_norm"] = optax.global_norm(g)
+    if _FLAX_NEW_OPTIMIZER_API:
+        opt.update(mdl, g)
+    else:
+        opt.update(g)
     return m
 
 data_sharding = NamedSharding(mesh, P("fsdp", None))
@@ -548,12 +646,23 @@ if proc == 0:
     print(f"  PRETRAINED: {n_loaded} tensors")
     if WANDB_LOG:
         print(f"  wandb={WANDB_PROJECT} mode={WANDB_MODE}")
-    if CHECKPOINT_STEPS > 0:
-        print(f"  checkpoints every {CHECKPOINT_STEPS} steps -> {CHECKPOINT_DIR}")
+    if CHECKPOINT_STEPS > 0 or CHECKPOINT_SECONDS > 0:
+        intervals = []
+        if CHECKPOINT_STEPS > 0:
+            intervals.append(f"{CHECKPOINT_STEPS} steps")
+        if CHECKPOINT_SECONDS > 0:
+            intervals.append(f"{CHECKPOINT_SECONDS}s")
+        print(f"  checkpoints every {' or '.join(intervals)} -> {CHECKPOINT_DIR}")
         if TPU_REGION:
             print(f"  checkpoint region={TPU_REGION} zone={TPU_ZONE}")
         if HF_CHECKPOINT_REPO and not CHECKPOINT_DIR_IS_GCS:
             print(f"  checkpoint hub repo={HF_CHECKPOINT_REPO} path={HF_CHECKPOINT_PATH}")
+    if DMAX_ENABLE:
+        print(
+            f"  DMax/OPUT: on_policy_ratio={DMAX_ON_POLICY_RATIO} "
+            f"noise=[{DMAX_NOISE_LOW},{DMAX_NOISE_HIGH}] block_size={DMAX_BLOCK_SIZE} "
+            f"(block-diffusion forward length={MAX_LEN * 2})"
+        )
     if RESUME_DIR:
         print(f"  RESUME from {RESUME_DIR}" + (f" step={RESUME_STEP}" if RESUME_STEP > 0 else " (latest)"))
     print(f"{'='*70}", flush=True)
@@ -564,6 +673,7 @@ last_epoch = 0
 last_epoch_step = 0
 last_checkpoint_step = 0
 t_start = time.time()
+last_checkpoint_time = t_start
 
 def repo_path(*parts: str) -> str:
     return "/".join(part.strip("/") for part in (HF_CHECKPOINT_PATH, *parts) if part and part.strip("/"))
@@ -714,10 +824,14 @@ def orbax_set_mesh_context_patch():
         jax.sharding.set_mesh = original_set_mesh
 
 def save_training_checkpoint(global_step: int, epoch: int, epoch_step: int, *, force: bool = False):
-    global last_checkpoint_step
+    global last_checkpoint_step, last_checkpoint_time
     if global_step <= 0:
         return
-    if not force and (CHECKPOINT_STEPS <= 0 or global_step % CHECKPOINT_STEPS != 0):
+    checkpoint_due = CHECKPOINT_STEPS > 0 and global_step % CHECKPOINT_STEPS == 0
+    checkpoint_due = checkpoint_due or (
+        CHECKPOINT_SECONDS > 0 and (time.time() - last_checkpoint_time) >= CHECKPOINT_SECONDS
+    )
+    if not force and not checkpoint_due:
         return
     if last_checkpoint_step == global_step:
         return
@@ -810,6 +924,7 @@ def save_training_checkpoint(global_step: int, epoch: int, epoch_step: int, *, f
     sync_all(f"checkpoint-uploaded-{global_step}")
     prune_local_checkpoints()
     last_checkpoint_step = global_step
+    last_checkpoint_time = time.time()
     if proc == 0:
         print(f"[Worker {proc}] Checkpoint {checkpoint_name} complete", flush=True)
         if wandb_run is not None:
@@ -840,18 +955,41 @@ def run_training_step(global_step: int, epoch: int, epoch_step: int, total_steps
     if debug_step:
         print(f"[Worker {proc}] step {global_step}: masking start", flush=True)
     rng, sk = jax.random.split(rng)
-    rng_t, rng_m = jax.random.split(sk)
-    maskable = jnp.ones_like(ids, dtype=bool)
-    t = mdlm_cfg.time_epsilon + (1.0 - mdlm_cfg.time_epsilon) * jax.random.uniform(rng_t, (ids.shape[0],))
-    p_mask = 1.0 - alpha_sched(t)[:, None]
+    rng_t, rng_m, rng_flag = jax.random.split(sk, 3)
+    maskable = labels != -100
+
+    if DMAX_ENABLE:
+        # DMax: fixed high-noise masking ratio (paper default 0.75).
+        if DMAX_NOISE_LOW == DMAX_NOISE_HIGH:
+            p_mask = jnp.full((ids.shape[0], 1), DMAX_NOISE_LOW, dtype=jnp.float32)
+        else:
+            p_mask = jax.random.uniform(
+                rng_t, (ids.shape[0], 1), minval=DMAX_NOISE_LOW, maxval=DMAX_NOISE_HIGH, dtype=jnp.float32
+            )
+        # Uniform loss weights (no 1/t reweighting for OPUT).
+        w = jnp.ones_like(ids, dtype=jnp.float32)
+        on_policy_flag = jax.random.bernoulli(rng_flag, DMAX_ON_POLICY_RATIO, shape=(ids.shape[0],))
+        seq_len = ids.shape[1]
+        base_pos = jnp.broadcast_to(jnp.arange(seq_len)[None, :], ids.shape)
+        position_ids = jnp.concatenate([base_pos, base_pos], axis=1)
+        attention_mask = create_block_diffusion_attention_mask(seq_len, DMAX_BLOCK_SIZE)
+    else:
+        t = mdlm_cfg.time_epsilon + (1.0 - mdlm_cfg.time_epsilon) * jax.random.uniform(rng_t, (ids.shape[0],))
+        p_mask = 1.0 - alpha_sched(t)[:, None]
+        w = alpha_sched.weight(t)[:, None] * jnp.ones_like(ids, dtype=jnp.float32)
+        on_policy_flag = None
+        position_ids = None
+        attention_mask = None
+
     masked = jax.random.bernoulli(rng_m, p_mask, shape=ids.shape) & maskable
     noised = jnp.where(masked, mask_id, ids)
-    w = alpha_sched.weight(t)[:, None] * jnp.ones_like(ids, dtype=jnp.float32)
+    model_input_ids = jnp.concatenate([noised, ids], axis=1) if DMAX_ENABLE else noised
 
     batch = {
-        "input_ids": ids, "attention_mask": None, "labels": labels,
+        "input_ids": ids, "attention_mask": attention_mask, "labels": labels,
         "maskable_mask": maskable, "masked_mask": masked,
-        "loss_weights": w, "model_input_ids": noised,
+        "loss_weights": w, "model_input_ids": model_input_ids,
+        "position_ids": position_ids, "on_policy_flag": on_policy_flag,
     }
     if debug_step:
         print(f"[Worker {proc}] step {global_step}: train_step start", flush=True)
@@ -859,6 +997,8 @@ def run_training_step(global_step: int, epoch: int, epoch_step: int, total_steps
     train_t0 = time.time()
     metrics = train_step(model, optimizer, batch)
     loss_val = float(metrics["loss"])
+    grad_nonfinite_count_val = int(metrics.get("grad_nonfinite_count", 0))
+    grad_norm_val = float(metrics.get("grad_norm", 0.0))
     train_dt = time.time() - train_t0
     ntok = GLOBAL_BATCH * MAX_LEN
     total_tokens += ntok
@@ -875,11 +1015,15 @@ def run_training_step(global_step: int, epoch: int, epoch_step: int, total_steps
             progress = f"epoch {epoch:2d}/{NUM_EPOCHS} step {epoch_step:5d} global {global_step:6d}"
         else:
             progress = f"step {global_step:3d}/{total_steps}"
+        grad_note = f" | grad_norm={grad_norm_val:.2e}"
+        if grad_nonfinite_count_val:
+            grad_note += f" grad_nf={grad_nonfinite_count_val}"
         print(f"  {progress} | loss={loss_val:8.4f} | "
               f"{ntok:,} tok | {dt:5.1f}s | {tokens_per_second:,.0f} tok/s | "
               f"mfu={attention_adjusted_mfu*100:4.1f}% "
               f"(dense={dense_mfu*100:4.1f}%) | "
-              f"data={data_dt:.2f}s put={put_dt:.2f}s train={train_dt:.2f}s",
+              f"data={data_dt:.2f}s put={put_dt:.2f}s train={train_dt:.2f}s"
+              f"{grad_note}",
               flush=True)
         if wandb_run is not None and (global_step == 1 or global_step % LOGGING_STEPS == 0):
             wandb.log(
@@ -894,6 +1038,8 @@ def run_training_step(global_step: int, epoch: int, epoch_step: int, total_steps
                     "train/compiled_train_time_seconds": train_dt,
                     "train/mfu_attention_adjusted": attention_adjusted_mfu,
                     "train/mfu_dense": dense_mfu,
+                    "train/grad_norm": grad_norm_val,
+                    "train/grad_nonfinite_count": grad_nonfinite_count_val,
                     "epoch": epoch,
                     "epoch_step": epoch_step,
                 },

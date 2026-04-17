@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import pickle
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -15,7 +17,7 @@ from flax.training import checkpoints
 import numpy as np
 import optax
 
-from dllm_jax.configs import BD3LMConfig, DreamConfig, EditFlowConfig, MDLMConfig
+from dllm_jax.configs import BD3LMConfig, DMaxConfig, DreamConfig, EditFlowConfig, MDLMConfig
 from dllm_jax.data import iter_dataset_batches, num_batches, parse_interval
 from dllm_jax.schedulers import (
     BaseAlphaScheduler,
@@ -25,6 +27,20 @@ from dllm_jax.schedulers import (
 )
 
 BLANK = -1
+
+
+def resolve_mask_token_id(tokenizer, vocab_size: int | None = None) -> int:
+    mask_token_id = getattr(tokenizer, "mask_token_id", None)
+    if mask_token_id is None:
+        mask_token_id = getattr(tokenizer, "mask_id", None)
+    if mask_token_id is None and vocab_size is not None:
+        mask_token_id = int(vocab_size) - 1
+    if mask_token_id is None:
+        raise ValueError(
+            "A mask token id is required. Set tokenizer.mask_token_id or pass a "
+            "model with spec.vocab_size so the final vocabulary id can be used."
+        )
+    return int(mask_token_id)
 
 
 def prepend_bos(batch: dict[str, jnp.ndarray], bos_token_id: int, label_pad_token_id: int = -100):
@@ -167,6 +183,7 @@ class BaseTrainer:
         self.global_step = 0
         self.rng = jax.random.key(args.seed)
         self.total_steps = self._resolve_total_steps()
+        self._lr_schedule = self._build_schedule()
         self.optimizer = nnx.Optimizer(
             self.model,
             self._build_optimizer(),
@@ -219,7 +236,7 @@ class BaseTrainer:
         return optax.chain(
             optax.clip_by_global_norm(self.args.grad_clip_norm),
             optax.adamw(
-                learning_rate=self._build_schedule(),
+                learning_rate=self._lr_schedule,
                 weight_decay=self.args.weight_decay,
             ),
         )
@@ -242,6 +259,37 @@ class BaseTrainer:
             return metrics
 
         return train_step
+
+    def _build_microbatch_grad_step(self):
+        """Compute grads for one micro-batch without applying them.
+
+        Used by the gradient-accumulation path to accumulate grads across
+        ``gradient_accumulation_steps`` micro-batches before calling
+        ``optimizer.update``. Mirrors reference train_llada2_bd_oput.py which
+        divides each micro-batch's loss by ``len(micro_batches)`` and sums.
+        """
+
+        loss_fn = self.loss_fn
+
+        @nnx.jit
+        def grad_step(model, batch, scale):
+            def objective(current_model):
+                loss, metrics = loss_fn(current_model, batch)
+                scaled = loss * scale
+                return scaled, metrics
+            (_, metrics), grads = nnx.value_and_grad(objective, has_aux=True)(model)
+            return grads, metrics
+
+        return grad_step
+
+    def _apply_accumulated_grads(self):
+        optimizer = self.optimizer
+        model = self.model
+
+        @nnx.jit
+        def apply(model, optimizer, grads):
+            optimizer.update(grads)
+        return apply
 
     def _build_eval_step(self):
         loss_fn = self.loss_fn
@@ -275,21 +323,42 @@ class BaseTrainer:
 
     def save_model(self, output_dir: str):
         os.makedirs(output_dir, exist_ok=True)
-        target = {
-            "model": nnx.state(self.model),
-            "optimizer": nnx.state(self.optimizer),
-            "step": np.asarray(self.global_step, dtype=np.int32),
-        }
-        checkpoints.save_checkpoint(ckpt_dir=output_dir, target=target, step=self.global_step, overwrite=True)
+        model_state = jax.tree.map(jax.device_get, nnx.state(self.model))
+        if self.args.save_only_model:
+            with open(os.path.join(output_dir, "model_state.pkl"), "wb") as f:
+                pickle.dump(
+                    {"model": model_state, "step": np.asarray(self.global_step, dtype=np.int32)},
+                    f,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+        else:
+            target = {
+                "model": model_state,
+                "step": np.asarray(self.global_step, dtype=np.int32),
+            }
+            target["optimizer"] = jax.tree.map(jax.device_get, nnx.state(self.optimizer))
+            checkpoints.save_checkpoint(ckpt_dir=output_dir, target=target, step=self.global_step, overwrite=True)
         if self.config is not None:
             self.config.save_pretrained(output_dir)
+        if self.tokenizer is not None and hasattr(self.tokenizer, "save_pretrained"):
+            self.tokenizer.save_pretrained(output_dir)
+        with open(os.path.join(output_dir, "training_state.json"), "w") as f:
+            json.dump({"global_step": int(self.global_step)}, f)
 
     def train(self):
-        if self.args.gradient_accumulation_steps != 1:
-            raise NotImplementedError("gradient_accumulation_steps != 1 is not implemented in the JAX backend yet.")
+        grad_accum = max(1, int(self.args.gradient_accumulation_steps))
         logging_steps = parse_interval(self.total_steps, self.args.logging_steps)
         eval_steps = parse_interval(self.total_steps, self.args.eval_steps)
         save_steps = parse_interval(self.total_steps, self.args.save_steps)
+
+        if grad_accum > 1:
+            micro_grad_step = nnx.cached_partial(
+                self._build_microbatch_grad_step(), self.model
+            )
+            apply_step = nnx.cached_partial(
+                self._apply_accumulated_grads(), self.model, self.optimizer
+            )
+            scale = jnp.asarray(1.0 / grad_accum, dtype=jnp.float32)
 
         if self.args.eval_on_start and self.eval_dataset is not None:
             print(self.evaluate())
@@ -303,16 +372,43 @@ class BaseTrainer:
                 self.data_collator,
                 shuffle=self.args.shuffle,
                 seed=self.args.seed + epoch,
-                max_steps=self.total_steps - step,
+                max_steps=(self.total_steps - step) * grad_accum,
             )
+            micro_batches: list[dict[str, Any]] = []
+            last_metrics = None
             for raw_batch in iterator:
                 self.rng, step_key = jax.random.split(self.rng)
                 batch = self.prepare_batch(raw_batch, step_key)
-                metrics = self._compiled_train_step(batch)
-                step += 1
+
+                if grad_accum == 1:
+                    last_metrics = self._compiled_train_step(batch)
+                    step += 1
+                else:
+                    micro_batches.append(batch)
+                    if len(micro_batches) < grad_accum:
+                        continue
+                    accumulated = None
+                    accumulated_loss = 0.0
+                    for mb in micro_batches:
+                        grads, metrics = micro_grad_step(mb, scale)
+                        accumulated = (
+                            grads
+                            if accumulated is None
+                            else jax.tree.map(jnp.add, accumulated, grads)
+                        )
+                        accumulated_loss += float(metrics["loss"])
+                    apply_step(accumulated)
+                    micro_batches = []
+                    last_metrics = {"loss": jnp.asarray(accumulated_loss / grad_accum)}
+                    step += 1
+
                 self.global_step = step
-                if logging_steps and step % logging_steps == 0:
-                    print({"step": step, "loss": float(metrics["loss"]), "learning_rate": float(self._build_schedule()(step))})
+                if logging_steps and step % logging_steps == 0 and last_metrics is not None:
+                    print({
+                        "step": step,
+                        "loss": float(last_metrics["loss"]),
+                        "learning_rate": float(self._lr_schedule(step)),
+                    })
                 if eval_steps and self.eval_dataset is not None and step % eval_steps == 0:
                     print({"step": step, **self.evaluate()})
                 if save_steps and step % save_steps == 0:
@@ -404,6 +500,164 @@ class BD3LMTrainer(MDLMTrainer):
             token_nll = token_nll / (jnp.clip(batch["maskable_mask"].sum(axis=-1, keepdims=True), min=1) * batch["maskable_mask"].shape[0])
         elif self.args.loss_norm_type == "batch":
             token_nll = token_nll / batch["maskable_mask"].shape[0]
+        else:
+            raise ValueError(f"Invalid loss_norm_type: {self.args.loss_norm_type}")
+        loss = token_nll.sum()
+        return loss, {"loss": loss}
+
+
+class DMaxTrainer(BaseTrainer):
+    """On-Policy Uniform Training (OPUT) for DMax-style dLLMs."""
+
+    def __init__(
+        self,
+        *,
+        model,
+        tokenizer,
+        args: DMaxConfig,
+        train_dataset,
+        eval_dataset=None,
+        data_collator=None,
+        config=None,
+    ):
+        vocab_size = getattr(getattr(model, "spec", None), "vocab_size", None)
+        self.mask_token_id = resolve_mask_token_id(tokenizer, vocab_size=vocab_size)
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        # If the tokenizer falls back pad_token_id onto eos/unk whose id happens
+        # to collide with mask_token_id, the trainer would silently treat padding
+        # as supervised masked positions.
+        if pad_token_id is not None and int(pad_token_id) == int(self.mask_token_id):
+            raise ValueError(
+                f"tokenizer.pad_token_id ({pad_token_id}) collides with "
+                f"mask_token_id ({self.mask_token_id}); set a distinct pad_token "
+                "before constructing DMaxTrainer."
+            )
+        super().__init__(
+            model=model,
+            tokenizer=tokenizer,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            data_collator=data_collator,
+            config=config,
+        )
+
+    def prepare_batch(self, raw_batch: dict[str, Any], rng_key):
+        batch = {key: jnp.asarray(value) for key, value in raw_batch.items()}
+        input_ids = batch["input_ids"]
+        labels = batch.get("labels")
+        if labels is None:
+            labels = input_ids
+            batch["labels"] = labels
+        maskable_mask = labels != -100
+        attention_mask = batch.get("attention_mask")
+
+        rng_noise, rng_mask, rng_flag = jax.random.split(rng_key, 3)
+        if "noisy_input_ids" in batch:
+            noised_input_ids = batch["noisy_input_ids"]
+            masked_mask = (noised_input_ids == self.mask_token_id) & maskable_mask
+        else:
+            if self.args.noise_range_low == self.args.noise_range_high:
+                p_mask = jnp.full(
+                    (input_ids.shape[0], 1),
+                    self.args.noise_range_low,
+                    dtype=jnp.float32,
+                )
+            else:
+                p_mask = jax.random.uniform(
+                    rng_noise,
+                    (input_ids.shape[0], 1),
+                    minval=self.args.noise_range_low,
+                    maxval=self.args.noise_range_high,
+                    dtype=jnp.float32,
+                )
+            masked_mask = jax.random.bernoulli(rng_mask, p_mask, shape=input_ids.shape) & maskable_mask
+            noised_input_ids = jnp.where(masked_mask, self.mask_token_id, input_ids)
+
+        if "flag" in batch:
+            on_policy_flag = batch["flag"].astype(bool)
+            if on_policy_flag.ndim > 1:
+                on_policy_flag = on_policy_flag.reshape((input_ids.shape[0], -1))[:, 0]
+            elif on_policy_flag.ndim == 0:
+                on_policy_flag = jnp.broadcast_to(on_policy_flag, (input_ids.shape[0],))
+        else:
+            on_policy_flag = jax.random.bernoulli(
+                rng_flag,
+                self.args.on_policy_ratio,
+                shape=(input_ids.shape[0],),
+            )
+
+        seq_len = input_ids.shape[1]
+        base_pos = jnp.broadcast_to(jnp.arange(seq_len)[None, :], input_ids.shape)
+        position_ids = jnp.concatenate([base_pos, base_pos], axis=1)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": create_bd3lm_attention_mask(seq_len, self.args.block_size),
+            "raw_attention_mask": attention_mask,
+            "labels": labels,
+            "maskable_mask": maskable_mask,
+            "masked_mask": masked_mask,
+            "loss_weights": jnp.ones_like(input_ids, dtype=jnp.float32),
+            "model_input_ids": jnp.concatenate([noised_input_ids, input_ids], axis=1),
+            "position_ids": position_ids,
+            "on_policy_flag": on_policy_flag,
+        }
+
+    def _loss_mask_and_targets(self, batch: dict[str, jnp.ndarray], logits: jnp.ndarray):
+        # DMax OPUT trains the noised stream to predict x0 at every supervised
+        # position (labels != -100), not only at the currently-masked ones.
+        # Under the two-stream block-causal attention the clean stream provides
+        # context and is excluded from the loss; the noised stream's logits at
+        # position i are compared to the clean token at i (no AR-style shift).
+        if not self.args.same_token_labels:
+            raise NotImplementedError(
+                "DMax OPUT only supports same_token_labels=True; the AR-shift "
+                "branch was a vestigial autoregressive loss and has been removed."
+            )
+        targets = batch["input_ids"]
+        loss_mask = batch["maskable_mask"]
+        return logits, targets, loss_mask, batch["loss_weights"]
+
+    def loss_fn(self, model, batch: dict[str, jnp.ndarray]):
+        seq_len = batch["input_ids"].shape[1]
+        model_input_ids = batch["model_input_ids"]
+
+        rollout_logits = jax.lax.stop_gradient(
+            model(
+                model_input_ids,
+                attention_mask=batch["attention_mask"],
+                position_ids=batch["position_ids"],
+            )["logits"]
+        )
+        semi_input_ids = jnp.argmax(rollout_logits[:, :seq_len], axis=-1)
+        on_policy = batch["on_policy_flag"][:, None]
+        noised_input_ids = jnp.where(
+            batch["masked_mask"] & on_policy,
+            semi_input_ids,
+            model_input_ids[:, :seq_len],
+        )
+        model_input_ids = jnp.concatenate([noised_input_ids, model_input_ids[:, seq_len:]], axis=1)
+
+        outputs = model(
+            model_input_ids,
+            attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
+        )
+        logits, targets, loss_mask, loss_weights = self._loss_mask_and_targets(
+            batch,
+            outputs["logits"][:, :seq_len],
+        )
+        token_nll = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+        token_nll = token_nll * loss_weights * loss_mask.astype(token_nll.dtype)
+        if self.args.loss_norm_type == "token":
+            token_nll = token_nll / jnp.clip(loss_mask.sum(), min=1)
+        elif self.args.loss_norm_type == "sequence":
+            token_nll = token_nll / (
+                jnp.clip(loss_mask.sum(axis=-1, keepdims=True), min=1)
+                * loss_mask.shape[0]
+            )
+        elif self.args.loss_norm_type == "batch":
+            token_nll = token_nll / loss_mask.shape[0]
         else:
             raise ValueError(f"Invalid loss_norm_type: {self.args.loss_norm_type}")
         loss = token_nll.sum()

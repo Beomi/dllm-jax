@@ -342,38 +342,81 @@ class SelfAttention(nnx.Module):
             self.q_norm = None
             self.k_norm = None
 
-    def __call__(self, hidden_states, *, attention_mask=None, position_ids=None):
+    def _project_qkv(self, hidden_states, position_ids):
         batch_size, query_len, _ = hidden_states.shape
         if position_ids is None:
-            position_ids = jnp.broadcast_to(jnp.arange(query_len)[None, :], (batch_size, query_len))
-
+            position_ids = jnp.broadcast_to(
+                jnp.arange(query_len)[None, :], (batch_size, query_len)
+            )
         q = self.q_proj(hidden_states).reshape(batch_size, query_len, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).reshape(batch_size, query_len, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).reshape(batch_size, query_len, self.num_kv_heads, self.head_dim)
-
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
-
         cos, sin = build_rope(position_ids, self.rotary_dim, self.rope_theta, q.dtype)
         q, k = apply_rope(q, k, cos, sin, self.rotary_dim)
+        return q, k, v
 
+    def _attention(self, q, k, v, attention_mask):
+        batch_size, query_len, _, _ = q.shape
+        key_len = k.shape[1]
         if self.num_kv_heads != self.num_heads:
             repeats = self.num_heads // self.num_kv_heads
             k = jnp.repeat(k, repeats, axis=2)
             v = jnp.repeat(v, repeats, axis=2)
-
         if _FLASH_ATTN_FN is not None and attention_mask is None:
             output = _FLASH_ATTN_FN(
                 q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3),
                 1.0 / math.sqrt(self.head_dim),
             ).transpose(0, 2, 1, 3).reshape(batch_size, query_len, self.num_heads * self.head_dim)
         else:
-            mask = expand_attention_mask(attention_mask, batch_size, query_len, query_len)
+            mask = expand_attention_mask(attention_mask, batch_size, query_len, key_len)
             output = jax.nn.dot_product_attention(q, k, v, mask=mask).reshape(
                 batch_size, query_len, self.num_heads * self.head_dim,
             )
         return self.o_proj(output)
+
+    def __call__(self, hidden_states, *, attention_mask=None, position_ids=None):
+        q, k, v = self._project_qkv(hidden_states, position_ids)
+        return self._attention(q, k, v, attention_mask)
+
+    def call_cached(
+        self,
+        hidden_states,
+        past_k,
+        past_v,
+        cache_position,
+        *,
+        attention_mask,
+        position_ids,
+    ):
+        """Run attention using a KV cache buffer.
+
+        ``past_k`` / ``past_v`` have shape ``[B, max_seq, num_kv_heads, head_dim]``
+        and hold the cached K/V for earlier positions. The current step's K/V
+        (computed from ``hidden_states``, which has ``query_len`` positions
+        starting at ``cache_position``) is written into the buffers at
+        ``[cache_position, cache_position + query_len)`` via
+        ``jax.lax.dynamic_update_slice``. Attention then runs over the full
+        updated buffers.
+        """
+
+        q, k_new, v_new = self._project_qkv(hidden_states, position_ids)
+        # The cache buffers fix the attention precision: ``past_k`` should be
+        # in the same dtype as Q/K coming out of ``q_norm`` / ``k_norm`` (often
+        # float32 for RMSNorm), and ``past_v`` in the model's compute dtype.
+        # ``jax.nn.dot_product_attention`` requires Q and K to share dtype;
+        # V may differ.
+        past_k_updated = jax.lax.dynamic_update_slice(
+            past_k, k_new.astype(past_k.dtype), (0, cache_position, 0, 0)
+        )
+        past_v_updated = jax.lax.dynamic_update_slice(
+            past_v, v_new.astype(past_v.dtype), (0, cache_position, 0, 0)
+        )
+        q = q.astype(past_k.dtype)
+        output = self._attention(q, past_k_updated, past_v_updated, attention_mask)
+        return output, past_k_updated, past_v_updated
 
 
 class TransformerBlock(nnx.Module):
@@ -394,6 +437,28 @@ class TransformerBlock(nnx.Module):
         hidden_states = hidden_states + self.mlp(self.mlp_norm(hidden_states))
         return hidden_states
 
+    def call_cached(
+        self,
+        hidden_states,
+        past_k,
+        past_v,
+        cache_position,
+        *,
+        attention_mask,
+        position_ids,
+    ):
+        attn_out, new_past_k, new_past_v = self.self_attn.call_cached(
+            self.attn_norm(hidden_states),
+            past_k,
+            past_v,
+            cache_position,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        hidden_states = hidden_states + attn_out
+        hidden_states = hidden_states + self.mlp(self.mlp_norm(hidden_states))
+        return hidden_states, new_past_k, new_past_v
+
 
 class GenericDecoderLM(nnx.Module):
     def __init__(self, spec: ModelSpec, *, dtype_name: str, rngs: nnx.Rngs):
@@ -409,8 +474,15 @@ class GenericDecoderLM(nnx.Module):
         else:
             self.lm_head = None
 
-    def hidden_for_heads(self, input_ids, *, attention_mask=None, position_ids=None):
-        hidden_states = self.embed_tokens(input_ids)
+    def hidden_for_heads(self, input_ids=None, *, inputs_embeds=None, attention_mask=None, position_ids=None):
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("Pass either input_ids or inputs_embeds, not both.")
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("input_ids or inputs_embeds is required.")
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = inputs_embeds
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.arange(hidden_states.shape[1])[None, :],
@@ -425,9 +497,54 @@ class GenericDecoderLM(nnx.Module):
             return self.lm_head(hidden_states)
         return jnp.einsum("bld,vd->blv", hidden_states, self.embed_tokens.embedding[...])
 
-    def __call__(self, input_ids, *, attention_mask=None, position_ids=None):
-        hidden_states = self.hidden_for_heads(input_ids, attention_mask=attention_mask, position_ids=position_ids)
+    def __call__(self, input_ids=None, *, inputs_embeds=None, attention_mask=None, position_ids=None):
+        hidden_states = self.hidden_for_heads(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
         return {"hidden_states": hidden_states, "logits": self._logits(hidden_states)}
+
+    def call_cached(
+        self,
+        *,
+        inputs_embeds,
+        past_key_values,
+        cache_position,
+        attention_mask,
+        position_ids,
+    ):
+        """KV-cached forward.
+
+        ``past_key_values`` is a list of ``(past_k, past_v)`` per layer, each of
+        shape ``[B, max_seq, num_kv_heads, head_dim]``. The current input
+        ``inputs_embeds`` has ``[B, query_len, H]`` and its K/V is written into
+        the cache at ``[cache_position, cache_position + query_len)``. Returns
+        ``{"logits", "past_key_values"}`` where logits are for the current
+        query positions only.
+        """
+
+        hidden_states = inputs_embeds
+        new_past_key_values = []
+        for layer_idx, layer in enumerate(self.layers):
+            past_k, past_v = past_key_values[layer_idx]
+            hidden_states, new_k, new_v = layer.call_cached(
+                hidden_states,
+                past_k,
+                past_v,
+                cache_position,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )
+            new_past_key_values.append((new_k, new_v))
+        hidden_states = self.norm(hidden_states)
+        logits = self._logits(hidden_states)
+        return {
+            "hidden_states": hidden_states,
+            "logits": logits,
+            "past_key_values": new_past_key_values,
+        }
 
 
 class GenericEncoderLM(nnx.Module):
@@ -449,18 +566,34 @@ class GenericEncoderLM(nnx.Module):
         else:
             self.lm_head = None
 
-    def backbone_hidden(self, input_ids, *, attention_mask=None, position_ids=None):
-        batch_size, seq_len = input_ids.shape
+    def backbone_hidden(self, input_ids=None, *, inputs_embeds=None, attention_mask=None, position_ids=None):
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("Pass either input_ids or inputs_embeds, not both.")
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("input_ids or inputs_embeds is required.")
+            batch_size, seq_len = input_ids.shape
+        else:
+            batch_size, seq_len = inputs_embeds.shape[:2]
         if position_ids is None:
             position_ids = jnp.broadcast_to(jnp.arange(seq_len)[None, :], (batch_size, seq_len))
-        hidden_states = self.embed_tokens(input_ids) + self.position_embeddings(position_ids)
+        if inputs_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = inputs_embeds
+        hidden_states = hidden_states + self.position_embeddings(position_ids)
         hidden_states = self.embed_norm(hidden_states)
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask=attention_mask, position_ids=position_ids)
         return self.norm(hidden_states)
 
-    def hidden_for_heads(self, input_ids, *, attention_mask=None, position_ids=None):
-        hidden_states = self.backbone_hidden(input_ids, attention_mask=attention_mask, position_ids=position_ids)
+    def hidden_for_heads(self, input_ids=None, *, inputs_embeds=None, attention_mask=None, position_ids=None):
+        hidden_states = self.backbone_hidden(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
         return self.mlm_norm(self.mlm_act(self.mlm_dense(hidden_states)))
 
     def _logits(self, hidden_states):
@@ -468,8 +601,13 @@ class GenericEncoderLM(nnx.Module):
             return self.lm_head(hidden_states)
         return jnp.einsum("bld,vd->blv", hidden_states, self.embed_tokens.embedding[...])
 
-    def __call__(self, input_ids, *, attention_mask=None, position_ids=None):
-        hidden_states = self.hidden_for_heads(input_ids, attention_mask=attention_mask, position_ids=position_ids)
+    def __call__(self, input_ids=None, *, inputs_embeds=None, attention_mask=None, position_ids=None):
+        hidden_states = self.hidden_for_heads(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
         return {"hidden_states": hidden_states, "logits": self._logits(hidden_states)}
 
 

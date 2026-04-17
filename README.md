@@ -9,8 +9,8 @@ and EditFlow objectives on pretrained HuggingFace checkpoints.
 - **Torch-free weight loading** — `safetensors` + `huggingface_hub` + numpy, no `torch.load`
 - **TPU-first** — Pallas flash attention via `shard_map`, 1D FSDP and 2D FSDP+TP
 - **Pretrained init** — load Qwen3, Llama, and other HF causal LMs directly into Flax NNX
-- **Four training objectives** — MDLM, BD3LM, Dream, EditFlow
-- **Clean API** — 34 public exports, no stub boilerplate
+- **Five training objectives** — MDLM, BD3LM, Dream, DMax/OPUT, EditFlow
+- **Clean API** — public exports, no stub boilerplate
 
 `transformers` is used only for `AutoConfig` / `AutoTokenizer` (works without torch).
 
@@ -111,12 +111,7 @@ default to use JAX multihost barriers for distributed GCS checkpoint writes.
 
 ```python
 from transformers import AutoTokenizer
-from dllm_jax import (
-    build_model_from_pretrained,
-    MDLMTrainer,
-    MDLMConfig,
-    LinearAlphaScheduler,
-)
+from dllm_jax import build_model_from_pretrained, MDLMConfig, MDLMTrainer, LinearAlphaScheduler
 
 model, config = build_model_from_pretrained("Qwen/Qwen3-0.6B", task="llada")
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
@@ -132,13 +127,74 @@ trainer = MDLMTrainer(
 trainer.train()
 ```
 
+## DMax / OPUT
+
+`dllm_jax` includes a JAX/Flax implementation of the DMax OPUT training loop
+and soft parallel decoding path from [`czg1225/DMax`](https://github.com/czg1225/DMax).
+OPUT uses fixed high-noise masking, block-diffusion attention, and optional
+on-policy replacement of masked tokens with the model's own greedy predictions.
+
+```python
+from dllm_jax import DMaxConfig, DMaxTrainer, DMaxDataCollator
+
+trainer = DMaxTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    args=DMaxConfig(
+        output_dir="./out-dmax",
+        max_steps=1000,
+        learning_rate=2e-6,
+        noise_range_low=0.75,
+        noise_range_high=0.75,
+        on_policy_ratio=0.5,
+        block_size=32,
+    ),
+    train_dataset=dataset,
+    data_collator=DMaxDataCollator(tokenizer=tokenizer, label_pad_token_id=-100),
+)
+trainer.train()
+```
+
+Generate with DMax soft parallel decoding:
+
+```python
+from dllm_jax import dmax_generate_spd
+
+output = dmax_generate_spd(
+    model,
+    input_ids,
+    tokenizer=tokenizer,
+    gen_length=512,
+    block_length=32,
+    steps=32,
+    threshold=0.95,
+)
+print(tokenizer.decode(output.generated_tokens[0], skip_special_tokens=True))
+```
+
+CLI entry points are available in `scripts/dmax_train.py` and
+`scripts/dmax_generate.py`.
+
+```bash
+python scripts/dmax_train.py \
+  --model Qwen/Qwen3-0.6B \
+  --dataset Zigeng/DMax-LLaDA-2.0-Mini-Math-Trajectories \
+  --max-steps 1000
+
+python scripts/dmax_generate.py \
+  --model Qwen/Qwen3-0.6B \
+  --prompt "Solve 37 * 48." \
+  --gen-length 256 --block-length 32 --steps 32
+```
+
 ## Package Layout
 
 ```
 dllm_jax/
 ├── models.py       # GenericDecoderLM, GenericEncoderLM, EditFlowModel
-├── trainers.py     # MDLMTrainer, BD3LMTrainer, DreamTrainer, EditFlowTrainer
+├── trainers.py     # MDLMTrainer, BD3LMTrainer, DreamTrainer, DMaxTrainer, EditFlowTrainer
 ├── configs.py      # ModelArguments, DataArguments, TrainingArguments, MDLMConfig, ...
+├── dmax.py         # DMax SPD generation helpers
 ├── schedulers.py   # LinearAlpha, CosineAlpha, LinearKappa, CubicKappa, CosineKappa
 ├── data.py         # Collators (NoAttentionMaskWrapper, DreamSFTCollator, ...)
 ├── weights.py      # Torch-free safetensors -> NNX weight loader

@@ -82,6 +82,33 @@ class DreamConfig(MDLMConfig):
 
 
 @dataclass
+class DMaxConfig(MDLMConfig):
+    noise_range_low: float = 0.75
+    noise_range_high: float = 0.75
+    on_policy_ratio: float = 0.5
+    block_size: int = 32
+    same_token_labels: bool = True
+    loss_weight_type: str = "uniform"
+    right_shift_logits: bool = False
+
+    def __post_init__(self):
+        parent_post_init = getattr(super(), "__post_init__", None)
+        if parent_post_init is not None:
+            parent_post_init()
+        if self.noise_range_low > self.noise_range_high:
+            raise ValueError(
+                f"noise_range_low ({self.noise_range_low}) cannot be greater than "
+                f"noise_range_high ({self.noise_range_high})."
+            )
+        if not 0.0 <= self.noise_range_low <= 1.0:
+            raise ValueError(f"noise_range_low must be in [0, 1], got {self.noise_range_low}.")
+        if not 0.0 <= self.noise_range_high <= 1.0:
+            raise ValueError(f"noise_range_high must be in [0, 1], got {self.noise_range_high}.")
+        if not 0.0 <= self.on_policy_ratio <= 1.0:
+            raise ValueError(f"on_policy_ratio must be in [0, 1], got {self.on_policy_ratio}.")
+
+
+@dataclass
 class EditFlowConfig(TrainingArguments):
     time_epsilon: float = 1e-3
     normalize_per_position: bool = True

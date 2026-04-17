@@ -120,6 +120,55 @@ class DreamSFTCollator(transformers.DataCollatorForSeq2Seq):
 
 
 @dataclass
+class DMaxDataCollator(transformers.DataCollatorForSeq2Seq):
+    """Seq2Seq-style padding that preserves DMax OPUT flags and noisy ids."""
+
+    def _pad_noisy_input_ids(self, sequences, target_length: int):
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+        output = np.full(
+            (len(sequences), target_length),
+            int(pad_token_id),
+            dtype=np.int64,
+        )
+        padding_side = getattr(self.tokenizer, "padding_side", "right")
+        for idx, sequence in enumerate(sequences):
+            values = np.asarray(sequence, dtype=np.int64)
+            if values.size == 0:
+                continue
+            if padding_side == "left":
+                output[idx, -min(values.size, target_length) :] = values[-target_length:]
+            else:
+                output[idx, : min(values.size, target_length)] = values[:target_length]
+        return output
+
+    def __call__(self, features, return_tensors=None):
+        clean_features = []
+        flags = []
+        noisy_input_ids = []
+        has_flag = any("flag" in feature for feature in features)
+        has_noisy = any("noisy_input_ids" in feature for feature in features)
+        for feature in features:
+            copied = dict(feature)
+            if has_flag:
+                flags.append(bool(copied.pop("flag", False)))
+            if has_noisy:
+                noisy_input_ids.append(copied.pop("noisy_input_ids", copied["input_ids"]))
+            clean_features.append(copied)
+        batch = super().__call__(clean_features, return_tensors=return_tensors)
+        if has_noisy:
+            target_length = np.asarray(batch["input_ids"]).shape[1]
+            batch["noisy_input_ids"] = self._pad_noisy_input_ids(
+                noisy_input_ids,
+                target_length,
+            )
+        if has_flag:
+            batch["flag"] = np.asarray(flags, dtype=np.bool_)
+        return batch
+
+
+@dataclass
 class X0Sampler:
     tokenizer: transformers.PreTrainedTokenizerBase | None = None
 
