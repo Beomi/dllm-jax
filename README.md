@@ -17,6 +17,10 @@ and EditFlow objectives on pretrained HuggingFace checkpoints.
 
 `transformers` is used only for `AutoConfig` / `AutoTokenizer` (works without torch).
 
+## Blog Post
+
+[dLLM into TPU: An End-to-End Diffusion LM Stack in Pure JAX](https://medium.com/@JunbumLee/dllm-into-tpu-an-end-to-end-diffusion-lm-stack-in-pure-jax-5fc33c840ebb)
+
 ## Prerequisites
 
 ### Google Cloud CLI (`gcloud`)
