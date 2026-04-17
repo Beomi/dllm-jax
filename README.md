@@ -1,5 +1,8 @@
 # dllm-jax
 
+<img max-width="100%" alt="Generated Image April 17, 2026 - 11_54PM" src="https://github.com/user-attachments/assets/cd62941c-20ad-44db-aa1a-98b77b8d498a" />
+
+
 A standalone **JAX backend for Diffusion Language Modeling (dLLM)** with **zero
 PyTorch or CUDA dependency**. Designed for TPU training of MDLM, BD3LM, Dream,
 and EditFlow objectives on pretrained HuggingFace checkpoints.
