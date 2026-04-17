@@ -11,6 +11,9 @@ and EditFlow objectives on pretrained HuggingFace checkpoints.
 - **Pretrained init** — load Qwen3, Llama, and other HF causal LMs directly into Flax NNX
 - **Five training objectives** — MDLM, BD3LM, Dream, DMax/OPUT, EditFlow
 - **Clean API** — public exports, no stub boilerplate
+- **DMax / OPUT end-to-end** — port of [`czg1225/DMax`](https://github.com/czg1225/DMax)
+  training + Soft Parallel Decoding inference, with a KV-cached fast path
+  matching reference's `cache='prefix'` setting
 
 `transformers` is used only for `AutoConfig` / `AutoTokenizer` (works without torch).
 
@@ -82,13 +85,38 @@ python3 -m pip install --user -U 'jax[tpu]' \
   huggingface_hub datasets wandb
 ```
 
+#### Verified TPU versions
+
+The training and inference paths are validated on TPU v4-32 (`us-central2-b`)
+with this stack — pin to these if `pip install '.[tpu]'` surfaces version
+drift:
+
+| Package | Version |
+|---------|---------|
+| Python | 3.10.12 |
+| jax / jaxlib | 0.6.2 |
+| libtpu | 0.0.17 |
+| flax | 0.10.7 |
+| optax | 0.2.8 |
+| orbax-checkpoint | 0.11.34 |
+| transformers | 5.5.3 |
+| safetensors | 0.7.0 |
+| datasets | 4.8.4 |
+| gcsfs / fsspec | 2025.3.2 |
+| huggingface_hub | 1.10.1 |
+| numpy | 2.2.6 |
+
+The 0.10.7 flax version forces the `_nnx_list = getattr(nnx, "List", list)`
+compat shim noted under **Gotchas**; newer flax (0.12+) on JAX 0.7+ should
+also work but hasn't been re-verified end-to-end on this repo.
+
 ### Regional GCS checkpoints for TPU runs
 
-`scripts/tpu_v6e_smoke.py` saves Flax checkpoints every `CHECKPOINT_STEPS`
-steps (default: 500). By default it detects the TPU zone, derives the
-region, and writes to the matching bucket named `gs://${CHECKPOINT_BUCKET_PREFIX}-${region}`.
-For example, a TPU in `us-east1-d` writes under
-`gs://dllm-jax-us-east1/checkpoints/${RUN_NAME}`.
+`scripts/tpu_v6e_smoke.py` saves sharded Orbax DCP checkpoints every
+`CHECKPOINT_STEPS` steps (default: 500). By default it detects the TPU
+zone, derives the region, and writes to a matching bucket named
+`gs://${CHECKPOINT_BUCKET_PREFIX}-${region}`. For example, a TPU in
+`us-east1-d` writes under `gs://dllm-jax-us-east1/checkpoints/${RUN_NAME}`.
 
 ```bash
 PYTHONPATH=/path/to/dllm-jax \
@@ -129,10 +157,29 @@ trainer.train()
 
 ## DMax / OPUT
 
-`dllm_jax` includes a JAX/Flax implementation of the DMax OPUT training loop
-and soft parallel decoding path from [`czg1225/DMax`](https://github.com/czg1225/DMax).
-OPUT uses fixed high-noise masking, block-diffusion attention, and optional
-on-policy replacement of masked tokens with the model's own greedy predictions.
+`dllm_jax` includes a JAX/Flax port of the DMax training and inference
+stack from [`czg1225/DMax`](https://github.com/czg1225/DMax):
+
+- **OPUT training** — fixed high-noise masking, two-stream `[noised | clean]`
+  layout with block-diffusion attention, per-step on-policy rollout that
+  replaces masked tokens with the model's own greedy predictions, gradient
+  accumulation support.
+- **Soft Parallel Decoding (SPD) inference** with three implementations
+  that produce byte-exact identical outputs at matching settings:
+  - `dmax_generate_spd` — Python-loop reference path with host-side early
+    breaks. Slow on TPU, useful for debugging.
+  - `dmax_generate_spd_fast` — fixed-shape fori_loop compiled path; step-level
+    and block-level early breaks via `jax.lax.while_loop`. Default for
+    short/medium generations.
+  - `dmax_generate_spd_kv_fast` — KV-cached variant matching reference's
+    `cache='prefix'` path. Each step only projects K/V for the active block
+    and attention runs over the cached prefix. ~1.6× speedup at 1024-token
+    generation; overhead dominates at 128-token generation.
+- **Reference knobs** — `top_k` (soft-mix top-k, reference default 1),
+  `temperature` + gumbel sampling, `seed`, `threshold`, `confidence_stop`,
+  `suppress_mask_token`, and post-EOS fill matching reference's `early_stop`.
+
+### Training
 
 ```python
 from dllm_jax import DMaxConfig, DMaxTrainer, DMaxDataCollator
@@ -148,6 +195,7 @@ trainer = DMaxTrainer(
         noise_range_high=0.75,
         on_policy_ratio=0.5,
         block_size=32,
+        gradient_accumulation_steps=4,  # optional
     ),
     train_dataset=dataset,
     data_collator=DMaxDataCollator(tokenizer=tokenizer, label_pad_token_id=-100),
@@ -155,59 +203,136 @@ trainer = DMaxTrainer(
 trainer.train()
 ```
 
-Generate with DMax soft parallel decoding:
+### Inference
 
 ```python
-from dllm_jax import dmax_generate_spd
+from dllm_jax import dmax_generate_spd_fast, dmax_generate_spd_kv_fast
 
-output = dmax_generate_spd(
+# Fast path (default for short/medium gen)
+output = dmax_generate_spd_fast(
     model,
     input_ids,
     tokenizer=tokenizer,
     gen_length=512,
     block_length=32,
     steps=32,
-    threshold=0.95,
+    threshold=0.5,        # reference math eval default
+    confidence_stop=0.9,  # reference block-level break
+    top_k=3,              # soft mix aggregates top 3 candidates
+    temperature=0.0,      # 0.0 = greedy; >0.0 = gumbel sampling
 )
 print(tokenizer.decode(output.generated_tokens[0], skip_special_tokens=True))
+
+# KV-cache path (wins on long generations)
+output = dmax_generate_spd_kv_fast(
+    model, input_ids, tokenizer=tokenizer,
+    gen_length=2048, block_length=32, steps=32,
+    threshold=0.5, top_k=3,
+)
 ```
 
-CLI entry points are available in `scripts/dmax_train.py` and
-`scripts/dmax_generate.py`.
+`output.nfe` counts actual forward passes. For `fast` it matches
+reference's `num_forwards`; for `kv_fast` it is `fast_nfe + num_active_blocks`
+(the extra is the post-block hard-write pass that replaces soft K/V with
+hard K/V in the cache — reference's cross-block update).
+
+### CLI entry points
 
 ```bash
+# Train
 python scripts/dmax_train.py \
   --model Qwen/Qwen3-0.6B \
   --dataset Zigeng/DMax-LLaDA-2.0-Mini-Math-Trajectories \
   --max-steps 1000
 
+# Generate (pretrained base model)
 python scripts/dmax_generate.py \
   --model Qwen/Qwen3-0.6B \
   --prompt "Solve 37 * 48." \
-  --gen-length 256 --block-length 32 --steps 32
+  --gen-length 256 --block-length 32 --steps 32 \
+  --threshold 0.5 --top-k 3 --impl fast
+
+# Generate (from a saved trainer checkpoint)
+python scripts/dmax_generate_checkpoint.py \
+  --checkpoint-dir ./out-dmax/checkpoint-1000 \
+  --prompt "Solve 37 * 48." \
+  --gen-length 256 --impl kv_fast
 ```
+
+For TPU/multi-host inference from a distributed Orbax checkpoint (GCS or
+local) see [`scripts/tpu_dmax_infer_checkpoint.py`](scripts/tpu_dmax_infer_checkpoint.py)
+and the runbook in [`docs/tpu_v4_32_ondemand_inference.md`](docs/tpu_v4_32_ondemand_inference.md).
+The KV-cache design is documented in [`docs/kv_cache_design.md`](docs/kv_cache_design.md).
+
+## Checkpoints
+
+Two save/load paths are supported depending on scale:
+
+- **Single-host trainer checkpoints** (`DMaxTrainer.save_model`, etc.) write
+  pickle files (`save_only_model=True`) or Flax training `Checkpoints` to a
+  local directory. These pair with `restore_model_checkpoint` and the local
+  `scripts/dmax_generate_checkpoint.py` script.
+- **Distributed TPU DCP checkpoints** (Orbax `PyTreeCheckpointHandler` /
+  `StandardCheckpointer`) are the durable save path for multi-host v4/v5/v6
+  training via `scripts/tpu_v6e_smoke.py`. Checkpoints are sharded across
+  workers, written directly to GCS (`gs://${CHECKPOINT_BUCKET_PREFIX}-${region}`),
+  and committed with `commit_success.txt` markers. Resume and inference read
+  the latest committed step via `latest_committed_gcs_step`.
+
+  ```bash
+  # Train with DCP checkpoints every 500 steps, keep last 2
+  PYTHONPATH=$(pwd) \
+    RUN_NAME=my-run CHECKPOINT_STEPS=500 CHECKPOINT_KEEP=2 \
+    python3 scripts/tpu_v6e_smoke.py
+
+  # Inference from the latest committed DCP checkpoint
+  RESUME_DIR=gs://$BUCKET/checkpoints/$RUN_NAME \
+    GEN_LENGTH=1024 INFER_IMPL=kv_fast TOP_K=3 TP=8 \
+    python3 scripts/tpu_dmax_infer_checkpoint.py
+  ```
+
+  The inference script restores the Orbax checkpoint, reshards across the
+  current inference mesh (which may differ from the training mesh), and
+  runs `dmax_generate_spd_{fast,kv_fast,legacy}` end-to-end.
 
 ## Package Layout
 
 ```
 dllm_jax/
-├── models.py       # GenericDecoderLM, GenericEncoderLM, EditFlowModel
+├── models.py       # GenericDecoderLM (+ call_cached for KV cache), GenericEncoderLM, EditFlowModel
 ├── trainers.py     # MDLMTrainer, BD3LMTrainer, DreamTrainer, DMaxTrainer, EditFlowTrainer
-├── configs.py      # ModelArguments, DataArguments, TrainingArguments, MDLMConfig, ...
-├── dmax.py         # DMax SPD generation helpers
+│                   # (gradient accumulation, cached LR schedule)
+├── configs.py      # ModelArguments, DataArguments, TrainingArguments, MDLMConfig, DMaxConfig, ...
+├── dmax.py         # DMax SPD: dmax_generate_spd, dmax_generate_spd_fast, dmax_generate_spd_kv_fast
 ├── schedulers.py   # LinearAlpha, CosineAlpha, LinearKappa, CubicKappa, CosineKappa
-├── data.py         # Collators (NoAttentionMaskWrapper, DreamSFTCollator, ...)
+├── data.py         # DMaxDataCollator, DreamSFTCollator, EditFlowCollator, NoAttentionMaskWrapper, ...
+├── checkpoints.py  # restore_model_checkpoint (single-host pickle / Flax Checkpoints)
 ├── weights.py      # Torch-free safetensors -> NNX weight loader
 └── utils.py        # resolve_with_base_env, parse_spec, get_default_logger, ...
+
+scripts/
+├── dmax_train.py                   # single-host DMax OPUT CLI
+├── dmax_tinystories_train.py       # small-scale DMax sanity training
+├── dmax_generate.py                # single-host SPD generation CLI (base model)
+├── dmax_generate_checkpoint.py     # single-host SPD generation from a saved checkpoint
+├── tpu_dmax_infer_checkpoint.py    # multi-host Orbax DCP restore + SPD generation
+├── tpu_v4_32_train_3epoch.py       # multi-host DMax training on TPU v4-32
+├── run_tpu_v4_32_3epoch.sh         # wrapper for the v4-32 training launch
+└── tpu_v6e_smoke.py                # MDLM smoke trainer with DCP checkpointing
+
+docs/
+├── tpu_v4_32_ondemand_inference.md # runbook for TPU inference from GCS checkpoints
+└── kv_cache_design.md              # design notes for the KV-cached SPD path
 ```
 
 ## Sharding
 
-| Model Size | Strategy    | Mesh Shape         | Notes                                     |
-|------------|-------------|--------------------|-------------------------------------------|
-| <= 3B      | 1D FSDP     | `(ndev,)` "fsdp"   | Direct TPU init, `P("fsdp", None)`        |
-| 3B - 8B+   | 2D FSDP+TP  | `(8, 8)` fsdp,tp   | CPU init -> shard, `P("fsdp", "tp")`      |
+| Model Size | Strategy    | Mesh Shape           | Notes                                     |
+|------------|-------------|----------------------|-------------------------------------------|
+| <= 3B      | 1D FSDP     | `(ndev,)` fsdp       | Direct TPU init, `P("fsdp", None)`        |
+| 3B - 8B+   | 2D FSDP+TP  | `(ndev/tp, tp)` fsdp,tp | CPU init → shard, `P("fsdp", "tp")`   |
 
+For example, TPU v4-32 with `TP=8` uses `(2, 8)`; TPU v5e-64 uses `(8, 8)`.
 Large models additionally need CPU-first init
 (`jax.default_device(jax.devices("cpu")[0])`), gradient checkpointing via
 `jax.remat` on each transformer layer, and Pallas flash attention.

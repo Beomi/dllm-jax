@@ -7,7 +7,12 @@ import argparse
 import jax.numpy as jnp
 import transformers
 
-from dllm_jax import build_model_from_pretrained, dmax_generate_spd, dmax_generate_spd_fast
+from dllm_jax import (
+    build_model_from_pretrained,
+    dmax_generate_spd,
+    dmax_generate_spd_fast,
+    dmax_generate_spd_kv_fast,
+)
 
 
 def parse_args():
@@ -24,7 +29,7 @@ def parse_args():
     parser.add_argument("--eos-token-id", type=int, default=None)
     parser.add_argument("--no-load-weights", action="store_true")
     parser.add_argument("--chat-template", action="store_true")
-    parser.add_argument("--impl", choices=["fast", "legacy"], default="fast")
+    parser.add_argument("--impl", choices=["fast", "legacy", "kv_fast"], default="fast")
     parser.add_argument("--bucket-length", type=int, default=None,
                         help="Fast-path bucket length (defaults to total generation length).")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -57,7 +62,11 @@ def main():
         load_weights=not args.no_load_weights,
     )
     input_ids = encode_prompt(tokenizer, args.prompt, args.chat_template)
-    generate_fn = dmax_generate_spd_fast if args.impl == "fast" else dmax_generate_spd
+    generate_fn = {
+        "fast": dmax_generate_spd_fast,
+        "legacy": dmax_generate_spd,
+        "kv_fast": dmax_generate_spd_kv_fast,
+    }[args.impl]
     kwargs = dict(
         tokenizer=tokenizer,
         gen_length=args.gen_length,

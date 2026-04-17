@@ -11,6 +11,7 @@ from dllm_jax import (
     build_model_from_config,
     dmax_generate_spd,
     dmax_generate_spd_fast,
+    dmax_generate_spd_kv_fast,
     restore_model_checkpoint,
 )
 
@@ -28,7 +29,7 @@ def parse_args():
     parser.add_argument("--mask-token-id", type=int, default=None)
     parser.add_argument("--eos-token-id", type=int, default=None)
     parser.add_argument("--chat-template", action="store_true")
-    parser.add_argument("--impl", choices=["fast", "legacy"], default="fast")
+    parser.add_argument("--impl", choices=["fast", "legacy", "kv_fast"], default="fast")
     parser.add_argument("--bucket-length", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=1)
@@ -61,7 +62,11 @@ def main():
     restore_model_checkpoint(model, args.checkpoint_dir)
 
     input_ids = encode_prompt(tokenizer, args.prompt, args.chat_template)
-    generate_fn = dmax_generate_spd_fast if args.impl == "fast" else dmax_generate_spd
+    generate_fn = {
+        "fast": dmax_generate_spd_fast,
+        "legacy": dmax_generate_spd,
+        "kv_fast": dmax_generate_spd_kv_fast,
+    }[args.impl]
     kwargs = dict(
         tokenizer=tokenizer,
         gen_length=args.gen_length,
