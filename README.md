@@ -259,10 +259,81 @@ python scripts/dmax_generate_checkpoint.py \
   --gen-length 256 --impl kv_fast
 ```
 
-For TPU/multi-host inference from a distributed Orbax checkpoint (GCS or
-local) see [`scripts/tpu_dmax_infer_checkpoint.py`](scripts/tpu_dmax_infer_checkpoint.py)
-and the runbook in [`docs/tpu_v4_32_ondemand_inference.md`](docs/tpu_v4_32_ondemand_inference.md).
+### TPU multi-host inference
+
+[`scripts/tpu_dmax_infer_checkpoint.py`](scripts/tpu_dmax_infer_checkpoint.py)
+restores a distributed Orbax DCP checkpoint (GCS or local) on every worker,
+reshards across the inference mesh (which may differ from the training
+mesh), and runs `dmax_generate_spd_{fast,kv_fast,legacy}` end-to-end. All
+configuration is via environment variables:
+
+```bash
+gcloud compute tpus tpu-vm ssh $TPU_NAME \
+  --zone=$ZONE --worker=all \
+  --command="cd ~/dllm-jax && \
+    RESUME_DIR=gs://$BUCKET/checkpoints/$RUN_NAME \
+    MODEL_NAME=Qwen/Qwen3-8B \
+    PROMPT='Once upon a time' \
+    GEN_LENGTH=1024 BLOCK_LENGTH=32 STEPS=32 \
+    INFER_IMPL=kv_fast TOP_K=3 THRESHOLD=0.5 CONFIDENCE_STOP=0.9 \
+    TP=8 \
+    python3 scripts/tpu_dmax_infer_checkpoint.py"
+```
+
+Omit `RESUME_STEP` and the script scans `commit_success.txt` files under
+`RESUME_DIR` and picks the latest committed step. Set `RESUME_STEP=<N>` to
+pin a specific step.
+
+#### Environment variables
+
+| Variable | Meaning | Default |
+|-|-|-|
+| `RESUME_DIR` / `RESUME_FROM` | checkpoint parent directory (contains `checkpoint_<step>/`) | — (required) |
+| `RESUME_STEP` | specific step to restore | latest committed |
+| `MODEL_NAME` | tokenizer + HF config source | `Qwen/Qwen3-8B` |
+| `PROMPT` | input prompt | `Once upon a time` |
+| `GEN_LENGTH` | tokens to generate | `32` |
+| `BLOCK_LENGTH` | DMax block size | `32` |
+| `STEPS` | max denoising steps per block | `8` |
+| `INFER_IMPL` | `fast`, `kv_fast`, or `legacy` | `fast` |
+| `FAST_BUCKET_LENGTH` | compile window for `fast`; ignored by `kv_fast` | `4096` |
+| `THRESHOLD` | left-to-right confidence cutoff — reference math eval `0.5`, code `0.65`, other benchmarks `0.9`–`0.95` | `0.95` |
+| `CONFIDENCE_STOP` | block early-exit confidence | `0.9` |
+| `TOP_K` | soft-mix top-k (reference default `1`; `3` is more coherent on undertrained ckpts) | `1` |
+| `TEMPERATURE` | gumbel-max sampling temperature; `0.0` = greedy | `0.0` |
+| `SEED` | RNG seed (only needed when `TEMPERATURE > 0`) | none |
+| `SUPPRESS_MASK_TOKEN` | set `1` to force-disable mask-token logits during argmax | `0` |
+| `MASK_TOKEN_ID` / `EOS_TOKEN_ID` | overrides for the model's mask / EOS id | tokenizer default |
+| `TP` | tensor-parallel axis size; `fsdp` is derived as `jax.device_count() // TP` | `8` |
+| `RESTORE_OPTIMIZER` | restore optimizer state (useful for resumed training, not inference) | `0` |
+
+#### Measured throughput (TPU v4-32, Qwen3-8B, `TOP_K=3`)
+
+| Config | nfe | generate_seconds |
+|-|-|-|
+| `fast`, GEN=128 | 114 | 32.1 |
+| `kv_fast`, GEN=128 | 119 | 65.9 |
+| `fast`, GEN=1024 | 1010 | 124.7 |
+| `kv_fast`, GEN=1024 | 1043 | 76.6 |
+
+At short generations `kv_fast` pays more XLA compile cost than it saves; at
+`GEN=1024` the block-local forward wins (~1.6× faster than `fast`). `nfe`
+for `kv_fast` is `fast_nfe + num_active_blocks`; the extra forwards are the
+post-block hard-write that overwrites soft K/V with hard K/V in the cache
+(the JAX analogue of reference's cross-block update).
+
+#### Troubleshooting
+
+- **Stale TPU checkout** — `ImportError: cannot import name 'dmax_generate_spd_kv_fast'` or similar means the TPU copy is out of date; re-`scp` `dllm_jax/` and the target script.
+- **Orbax signal-contract hang on restore** — handled by default; the script flips `CHECKPOINT_ORBAX_SIGNAL_FALLBACK=1` when the JAX distributed client isn't initialized. Set the env var to `0` to disable the shim explicitly.
+- **`gs://` / TensorFlow warnings** — harmless; restore uses Orbax's GCS client, not `tf.io.gfile`.
+- **First-run generation is "slow"** — includes model restore + XLA compile. Subsequent runs with identical shapes hit the cached graph.
+- **Output collapses into punctuation with `TOP_K=1`** — SPD feeds the previous step's distribution back as a soft mix; at `TOP_K=1` a low-confidence single token gives a bad signal. Try `TOP_K=3`.
+
 The KV-cache design is documented in [`docs/kv_cache_design.md`](docs/kv_cache_design.md).
+A narrative write-up of the whole end-to-end port — HF checkpoint →
+OPUT training → KV-cached SPD on TPU — is in
+[`docs/porting-dmax-to-tpu.md`](docs/porting-dmax-to-tpu.md).
 
 ## Checkpoints
 
@@ -284,16 +355,10 @@ Two save/load paths are supported depending on scale:
   PYTHONPATH=$(pwd) \
     RUN_NAME=my-run CHECKPOINT_STEPS=500 CHECKPOINT_KEEP=2 \
     python3 scripts/tpu_v6e_smoke.py
-
-  # Inference from the latest committed DCP checkpoint
-  RESUME_DIR=gs://$BUCKET/checkpoints/$RUN_NAME \
-    GEN_LENGTH=1024 INFER_IMPL=kv_fast TOP_K=3 TP=8 \
-    python3 scripts/tpu_dmax_infer_checkpoint.py
   ```
 
-  The inference script restores the Orbax checkpoint, reshards across the
-  current inference mesh (which may differ from the training mesh), and
-  runs `dmax_generate_spd_{fast,kv_fast,legacy}` end-to-end.
+  Inference from the resulting GCS checkpoints is covered above under
+  [TPU multi-host inference](#tpu-multi-host-inference).
 
 ## Package Layout
 
@@ -322,7 +387,8 @@ scripts/
 
 docs/
 ├── tpu_v4_32_ondemand_inference.md # runbook for TPU inference from GCS checkpoints
-└── kv_cache_design.md              # design notes for the KV-cached SPD path
+├── kv_cache_design.md              # design notes for the KV-cached SPD path
+└── porting-dmax-to-tpu.md          # narrative write-up of the whole end-to-end port
 ```
 
 ## Sharding
