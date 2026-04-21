@@ -17,12 +17,15 @@ All comparisons are at `MODEL_NAME=Qwen/Qwen3-8B`, `MAX_LEN=4096`,
 preserved training semantics (full OPUT rollout — changing semantics
 is separated below).
 
-The reported MFU still **under-counts DMax work by ~2×** because
-`tpu_v6e_smoke.py:312` credits only one forward at `seq=MAX_LEN`
-while DMax actually runs fwd+bwd on `seq=2·MAX_LEN` plus a rollout
-forward on `seq=2·MAX_LEN`. Real hardware MFU at EE is therefore
-roughly **~29% of v5e bf16 peak** — i.e., the compiled graph reaches
-about a third of MXU peak on these shapes.
+The reported MFU above is under the **original** formula that credited
+one fwd+bwd at `seq=MAX_LEN`. In reality DMax's compiled graph runs
+fwd+bwd at `seq=2·MAX_LEN` and — whenever `DMAX_ON_POLICY_RATIO > 0`
+— also pays a stop_gradient rollout forward at `seq=2·MAX_LEN`. The
+attention term is quadratic, so the true multiplier is **~3.01×** (not
+2×). Under correct accounting the EE measurement is
+**≈ 44% of v5e bf16 peak**, i.e., the compiled graph reaches just under
+half of MXU peak on these shapes. Fixed in `tpu_v6e_smoke.py:319–337`
+(see item 1 below).
 
 ## Optimization ladder (full OPUT semantics preserved)
 
@@ -81,6 +84,7 @@ All exposed as env vars on `scripts/tpu_v6e_smoke.py`:
 | `SPLASH_BLOCK` | 512 | splash tile size (was 128 default) |
 | `SPLASH_FUSED_BWD` | 1 | enable fused `dkv`/`dq` backward kernel |
 | `DMAX_ON_POLICY_RATIO` | 0.5 | skips rollout fwd when 0 (see ablation below) |
+| `REMAT_POLICY` | nothing_saveable | `gate_up` / `qkv_gate_up` / `dots_saveable` / `everything_saveable` save more between fwd and bwd; saves recompute at HBM cost. |
 
 ## Peak config (EE) — reproduce
 
@@ -160,23 +164,29 @@ normally.
 
 In decreasing ROI:
 
-1. **Fix the DMax MFU formula** — purely cosmetic but the headline
-   number should reflect reality. `tpu_v6e_smoke.py:312`:
-   ```python
-   dmax_mult = 2 if DMAX_ENABLE else 1
-   TRAIN_FLOPS_PER_TOKEN_DENSE = 6 * EST_PARAMS * dmax_mult
-   TRAIN_FLOPS_PER_TOKEN_ATTN  = 12 * layers * MAX_LEN * H * dmax_mult
-   ```
-   Reported would go 14.7% → ~29%.
+1. ✅ **Fix the DMax MFU formula** — **implemented** in
+   `tpu_v6e_smoke.py:319–337`. The correct multiplier is **~3.01×**,
+   not 2×: fwd+bwd at 2L gives dense ×2 and attention ×4 (quadratic),
+   and the rollout fwd at 2L (always compiled when
+   `DMAX_ON_POLICY_RATIO > 0`) adds another ~0.67× dense and ~1.33×
+   attention. The new formula credits both passes at their actual
+   sequence lengths and reduces to the pre-DMax formula when
+   `DMAX_ENABLE=0`. Reported MFU on the EE config goes 14.7% → **~44%**
+   (attention-adjusted) without any change in wall-clock.
 2. **Fused SwiGLU Pallas kernel** — merges
    `down_proj(silu(gate_proj) * up_proj)` into one kernel. Avoids
    materializing the `(B, 2L, intermediate)` activation in HBM.
    Mostly reduces the 7.5% remat `while` cost. Estimated +1-3 pp MFU.
    Multi-day build.
-3. **Looser remat policy** — `save_only_these_names(["qkv", "gate_up"])`
-   with `checkpoint_name(...)` in the model. Would cut remat
-   recompute (~7.5% today) at the cost of HBM — risky given we're
-   near the B=64 ceiling.
+3. ⚙️ **Looser remat policy** — `REMAT_POLICY` env var now exposes
+   `gate_up`, `qkv_gate_up`, `dots_saveable`, `everything_saveable`
+   alongside the default `nothing_saveable`. `dllm_jax/models.py`
+   marks `q`/`k`/`v` (post-RoPE) and the gate·up product with
+   `checkpoint_name`, so the named policies are free to save them.
+   Not yet measured on v5e-64 — safest starting point is
+   `REMAT_POLICY=gate_up` at **B=32** (B=64 is likely to OOM given
+   saving `gate_up` at seq=2L costs ~24 KB × 2L × layers per sample,
+   ~14 GB per chip at B=64/FSDP=32 bf16).
 4. **Architectural: fold `[noised; clean]` into batch dim** instead of
    seq dim. Halves attention quadratic cost and the activation
    footprint. Requires rewriting the block-diffusion mask to run as

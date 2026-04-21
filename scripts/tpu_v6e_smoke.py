@@ -317,8 +317,25 @@ def estimate_model_params(cfg) -> int:
     return int(embedding_params + lm_head_params + layers * (attn_params + mlp_params + norm_params))
 
 EST_PARAMS = estimate_model_params(config)
-TRAIN_FLOPS_PER_TOKEN_DENSE = 6 * EST_PARAMS
-TRAIN_FLOPS_PER_TOKEN_ATTN = 12 * int(config.num_hidden_layers) * MAX_LEN * int(config.hidden_size)
+# DMax stacks [noised; clean] so each sample's compiled fwd+bwd runs at seq=2·L,
+# and when on_policy_ratio>0 the compiled graph also pays a stop_gradient rollout
+# fwd at seq=2·L (the per-sample on_policy_flag only gates the argmax, not execution).
+_seq_clean = MAX_LEN
+_seq_train_fwd = 2 * MAX_LEN if DMAX_ENABLE else MAX_LEN
+_seq_rollout_fwd = 2 * MAX_LEN if (DMAX_ENABLE and DMAX_ON_POLICY_RATIO > 0) else 0
+_layers = int(config.num_hidden_layers)
+_hidden = int(config.hidden_size)
+# 6N/token fwd+bwd + 2N/token rollout fwd (dense equivalent).
+_per_sample_dense = 6 * EST_PARAMS * _seq_train_fwd + 2 * EST_PARAMS * _seq_rollout_fwd
+# 12·L·seq²·H fwd+bwd + 4·L·seq²·H rollout fwd (dense attention reference, even
+# though splash may skip masked blocks — keeps the denominator comparable to the
+# non-DMax baseline).
+_per_sample_attn = (
+    12 * _layers * _seq_train_fwd * _seq_train_fwd * _hidden
+    + 4 * _layers * _seq_rollout_fwd * _seq_rollout_fwd * _hidden
+)
+TRAIN_FLOPS_PER_TOKEN_DENSE = _per_sample_dense // _seq_clean
+TRAIN_FLOPS_PER_TOKEN_ATTN = _per_sample_attn // _seq_clean
 TRAIN_FLOPS_PER_TOKEN_TOTAL = TRAIN_FLOPS_PER_TOKEN_DENSE + TRAIN_FLOPS_PER_TOKEN_ATTN
 PEAK_FLOPS = PEAK_TFLOPS_PER_CHIP * 1e12 * ndev
 
@@ -330,6 +347,8 @@ if wandb_run is not None:
             "train_flops_per_token_attention": TRAIN_FLOPS_PER_TOKEN_ATTN,
             "train_flops_per_token_total": TRAIN_FLOPS_PER_TOKEN_TOTAL,
             "peak_flops": PEAK_FLOPS,
+            "train_seq_train_fwd": _seq_train_fwd,
+            "train_seq_rollout_fwd": _seq_rollout_fwd,
         },
         allow_val_change=True,
     )
@@ -337,11 +356,14 @@ if wandb_run is not None:
 if proc == 0:
     print(f"[Worker {proc}] {MODEL_NAME}: {config.num_hidden_layers}L h={config.hidden_size} "
           f"V={config.vocab_size}", flush=True)
+    _dmax_tag = (
+        f" dmax(seq_fwd={_seq_train_fwd},rollout_fwd={_seq_rollout_fwd})" if DMAX_ENABLE else ""
+    )
     print(
         f"[Worker {proc}] estimated_params={EST_PARAMS/1e9:.2f}B "
         f"flops/token dense={TRAIN_FLOPS_PER_TOKEN_DENSE/1e9:.1f}G "
         f"attn={TRAIN_FLOPS_PER_TOKEN_ATTN/1e9:.1f}G "
-        f"peak={PEAK_FLOPS/1e15:.2f} PFLOP/s",
+        f"peak={PEAK_FLOPS/1e15:.2f} PFLOP/s{_dmax_tag}",
         flush=True,
     )
     if RUN_FULL_EPOCHS:
@@ -435,7 +457,33 @@ if DMAX_ENABLE:
             print(f"[Worker {proc}] Splash attention setup failed: {_exc}", flush=True)
 
 # ── Per-layer remat ────────────────────────────────────────
-remat_policy = jax.checkpoint_policies.nothing_saveable
+# REMAT_POLICY selects what to save between fwd and bwd. Saving more cuts the
+# ~7.5% recompute cost but increases HBM — risky near the B=64 ceiling.
+#   nothing_saveable   (default) recompute everything
+#   gate_up            save the MLP gate*up product (biggest matmuls)
+#   qkv_gate_up        also save q/k/v post-RoPE
+#   dots_saveable      jax preset: save all dot outputs
+#   everything_saveable jax preset: save everything (HBM-hungry)
+_REMAT_POLICY_NAME = os.environ.get("REMAT_POLICY", "nothing_saveable")
+if _REMAT_POLICY_NAME == "nothing_saveable":
+    remat_policy = jax.checkpoint_policies.nothing_saveable
+elif _REMAT_POLICY_NAME == "gate_up":
+    remat_policy = jax.checkpoint_policies.save_only_these_names("gate_up")
+elif _REMAT_POLICY_NAME == "qkv_gate_up":
+    remat_policy = jax.checkpoint_policies.save_only_these_names(
+        "q", "k", "v", "gate_up",
+    )
+elif _REMAT_POLICY_NAME == "dots_saveable":
+    remat_policy = jax.checkpoint_policies.dots_saveable
+elif _REMAT_POLICY_NAME == "everything_saveable":
+    remat_policy = jax.checkpoint_policies.everything_saveable
+else:
+    raise ValueError(
+        f"Unknown REMAT_POLICY={_REMAT_POLICY_NAME!r}; expected one of "
+        "nothing_saveable, gate_up, qkv_gate_up, dots_saveable, everything_saveable."
+    )
+if proc == 0:
+    print(f"[Worker {proc}] remat_policy={_REMAT_POLICY_NAME}", flush=True)
 
 def _remat_hidden_for_heads(self, input_ids=None, *, inputs_embeds=None, attention_mask=None, position_ids=None):
     if inputs_embeds is not None:

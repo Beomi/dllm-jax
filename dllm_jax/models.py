@@ -11,6 +11,7 @@ import math
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.ad_checkpoint import checkpoint_name
 import transformers
 
 # Compatibility: flax >= 0.11 has nnx.List; older versions use plain list()
@@ -295,7 +296,9 @@ class DenseMLP(nnx.Module):
 
     def __call__(self, hidden_states):
         if self.gated:
-            return self.down_proj(self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
+            gate_up = self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+            gate_up = checkpoint_name(gate_up, "gate_up")
+            return self.down_proj(gate_up)
         return self.fc2(self.act(self.fc1(hidden_states)))
 
 
@@ -360,6 +363,9 @@ class SelfAttention(nnx.Module):
             k = self.k_norm(k)
         cos, sin = build_rope(position_ids, self.rotary_dim, self.rope_theta, q.dtype)
         q, k = apply_rope(q, k, cos, sin, self.rotary_dim)
+        q = checkpoint_name(q, "q")
+        k = checkpoint_name(k, "k")
+        v = checkpoint_name(v, "v")
         return q, k, v
 
     def _attention(self, q, k, v, attention_mask):
