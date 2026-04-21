@@ -20,6 +20,11 @@ _nnx_list = getattr(nnx, "List", list)
 # Signature: _FLASH_ATTN_FN(q, k, v, sm_scale) with layout (batch, heads, seq, dim).
 _FLASH_ATTN_FN = None
 
+# Masked flash hook: set by training script for block-diffusion / other sparse masks.
+# Signature: _MASKED_FLASH_ATTN_FN(q, k, v, sm_scale) with same layout — mask baked in.
+# Used when attention_mask is passed (so dense attention would otherwise run).
+_MASKED_FLASH_ATTN_FN = None
+
 
 def get_dtype(name: str):
     if name == "float32":
@@ -366,6 +371,11 @@ class SelfAttention(nnx.Module):
             v = jnp.repeat(v, repeats, axis=2)
         if _FLASH_ATTN_FN is not None and attention_mask is None:
             output = _FLASH_ATTN_FN(
+                q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3),
+                1.0 / math.sqrt(self.head_dim),
+            ).transpose(0, 2, 1, 3).reshape(batch_size, query_len, self.num_heads * self.head_dim)
+        elif _MASKED_FLASH_ATTN_FN is not None and attention_mask is not None:
+            output = _MASKED_FLASH_ATTN_FN(
                 q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3),
                 1.0 / math.sqrt(self.head_dim),
             ).transpose(0, 2, 1, 3).reshape(batch_size, query_len, self.num_heads * self.head_dim)

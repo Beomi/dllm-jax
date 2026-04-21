@@ -83,10 +83,13 @@ ndev = jax.device_count()
 nlocal = jax.local_device_count()
 print(f"[Worker {proc}/{nproc}] devices={ndev} local={nlocal} backend={jax.default_backend()}", flush=True)
 
-# ── 2D mesh: FSDP (8) × TP (8) ──────────────────────────────
-TP = 8
-DP = ndev // TP  # 8 on v6e-64
-devices = mesh_utils.create_device_mesh((DP, TP))
+# ── 2D mesh: FSDP × TP (TP overridable via env, default 8) ──
+TP = int(os.environ.get("TP", "8"))
+DP = ndev // TP
+try:
+    devices = mesh_utils.create_device_mesh((DP, TP))
+except NotImplementedError:
+    devices = mesh_utils.create_device_mesh((DP, TP), allow_split_physical_axes=True)
 mesh = Mesh(devices, axis_names=("fsdp", "tp"))
 if proc == 0:
     print(f"[Worker {proc}] 2D Mesh: fsdp={DP} × tp={TP}", flush=True)
@@ -201,6 +204,12 @@ DMAX_ON_POLICY_RATIO = float(os.environ.get("DMAX_ON_POLICY_RATIO", "0.5"))
 DMAX_NOISE_LOW = float(os.environ.get("DMAX_NOISE_LOW", "0.75"))
 DMAX_NOISE_HIGH = float(os.environ.get("DMAX_NOISE_HIGH", "0.75"))
 DMAX_BLOCK_SIZE = int(os.environ.get("DMAX_BLOCK_SIZE", "32"))
+# ── XProf / JAX profiler ─────────────────────────────────────────────────────
+XPROF_ENABLE = env_flag("XPROF_ENABLE", False)
+XPROF_DIR = os.environ.get("XPROF_DIR", "/tmp/xprof/run")
+XPROF_START_STEP = int(os.environ.get("XPROF_START_STEP", "4"))
+XPROF_STOP_STEP = int(os.environ.get("XPROF_STOP_STEP", "7"))
+_xprof_active = False
 
 if WANDB_LOG and WANDB_MODE != "offline" and proc == 0:
     has_wandb_auth = bool(os.environ.get("WANDB_API_KEY")) or Path.home().joinpath(".netrc").exists()
@@ -359,6 +368,71 @@ def _sharded_flash_attn(q, k, v, sm_scale):
 dllm_models._FLASH_ATTN_FN = _sharded_flash_attn
 if proc == 0:
     print(f"[Worker {proc}] Pallas flash installed (blocks=512)", flush=True)
+
+# ── Splash attention for DMax block-diffusion mask ─────────
+# The dense-mask fallback in _attention is ~1.5-2s/step for Qwen3-8B at seq=8192;
+# splash_attention_kernel runs block-sparse flash over the block-diffusion pattern.
+if DMAX_ENABLE:
+    try:
+        from jax.experimental.pallas.ops.tpu.splash_attention import (
+            splash_attention_mask as _sm,
+            splash_attention_kernel as _sk,
+        )
+
+        def _block_diffusion_mask_numpy(seq_len_l: int, block_size: int) -> np.ndarray:
+            two_l = seq_len_l * 2
+            q_idx = np.arange(two_l)[:, None]
+            kv_idx = np.arange(two_l)[None, :]
+            x0_q = q_idx >= seq_len_l
+            x0_kv = kv_idx >= seq_len_l
+            block_q = np.where(x0_q, (q_idx - seq_len_l) // block_size, q_idx // block_size)
+            block_kv = np.where(x0_kv, (kv_idx - seq_len_l) // block_size, kv_idx // block_size)
+            bd = (block_q == block_kv) & (x0_q == x0_kv)
+            off = (block_q > block_kv) & x0_kv & (~x0_q)
+            bc = (block_q >= block_kv) & x0_kv & x0_q
+            return bd | off | bc
+
+        _num_heads_total = int(config.num_attention_heads)
+        _heads_per_tp = _num_heads_total // TP
+        _mask_np = _block_diffusion_mask_numpy(MAX_LEN, DMAX_BLOCK_SIZE).astype(np.bool_)
+        _splash_mask = _sm.MultiHeadMask(masks=[_sm.NumpyMask(_mask_np)] * _heads_per_tp)
+        _splash_bs = int(os.environ.get("SPLASH_BLOCK", "512"))
+        _splash_fused_bwd = env_flag("SPLASH_FUSED_BWD", True)
+        _bs_kwargs = dict(
+            block_q=_splash_bs, block_kv=_splash_bs, block_kv_compute=_splash_bs,
+            block_q_dkv=_splash_bs, block_kv_dkv=_splash_bs, block_kv_dkv_compute=_splash_bs,
+            use_fused_bwd_kernel=_splash_fused_bwd,
+        )
+        if not _splash_fused_bwd:
+            _bs_kwargs.update(block_q_dq=_splash_bs, block_kv_dq=_splash_bs)
+        _splash_block_sizes = _sk.BlockSizes(**_bs_kwargs)
+        _splash_fn = _sk.make_splash_mha_single_device(mask=_splash_mask, block_sizes=_splash_block_sizes)
+
+        def _splash_per_shard(q, k, v, sm_scale):
+            # q/k/v per shard: [B, H_local, T, D]. Splash expects [H, T, D] per call.
+            q_scaled = (q * sm_scale).astype(q.dtype)
+            return jax.vmap(_splash_fn)(q_scaled, k, v)
+
+        def _sharded_masked_flash(q, k, v, sm_scale):
+            return shard_map(
+                lambda q, k, v: _splash_per_shard(q, k, v, sm_scale),
+                mesh=mesh,
+                in_specs=(P("fsdp", "tp", None, None),) * 3,
+                out_specs=P("fsdp", "tp", None, None),
+                check_rep=False,
+            )(q, k, v)
+
+        dllm_models._MASKED_FLASH_ATTN_FN = _sharded_masked_flash
+        if proc == 0:
+            print(
+                f"[Worker {proc}] Splash attention installed for DMax block-diffusion "
+                f"(mask {_mask_np.shape}, heads_per_tp={_heads_per_tp}, "
+                f"block={_splash_bs}, fused_bwd={_splash_fused_bwd})",
+                flush=True,
+            )
+    except Exception as _exc:
+        if proc == 0:
+            print(f"[Worker {proc}] Splash attention setup failed: {_exc}", flush=True)
 
 # ── Per-layer remat ────────────────────────────────────────
 remat_policy = jax.checkpoint_policies.nothing_saveable
@@ -576,7 +650,8 @@ def loss_fn(mdl, batch):
     # DMax on-policy rollout: for examples flagged by on_policy_flag, replace
     # MASK tokens in the noisy half with the model's own greedy predictions
     # (stop_gradient) before the supervised forward.
-    if "on_policy_flag" in batch and batch["on_policy_flag"] is not None:
+    # Skip entirely when DMAX_ON_POLICY_RATIO=0 — saves a full 2L forward per step.
+    if DMAX_ON_POLICY_RATIO > 0 and "on_policy_flag" in batch and batch["on_policy_flag"] is not None:
         seq_len = batch["input_ids"].shape[1]
         flag = batch["on_policy_flag"][:, None]  # [B, 1]
         rollout_logits = jax.lax.stop_gradient(
@@ -931,7 +1006,7 @@ def save_training_checkpoint(global_step: int, epoch: int, epoch_step: int, *, f
             wandb.log({"checkpoint/global_step": global_step}, step=global_step)
 
 def run_training_step(global_step: int, epoch: int, epoch_step: int, total_steps: int | None):
-    global rng, total_tokens, last_epoch, last_epoch_step
+    global rng, total_tokens, last_epoch, last_epoch_step, _xprof_active
     ts = time.time()
     data_t0 = time.time()
     debug_step = global_step == 1
@@ -994,6 +1069,14 @@ def run_training_step(global_step: int, epoch: int, epoch_step: int, total_steps
     if debug_step:
         print(f"[Worker {proc}] step {global_step}: train_step start", flush=True)
 
+    if XPROF_ENABLE and global_step == XPROF_START_STEP and not _xprof_active:
+        import jax.profiler as _jprof
+        Path(XPROF_DIR).mkdir(parents=True, exist_ok=True)
+        _jprof.start_trace(XPROF_DIR)
+        _xprof_active = True
+        if proc == 0:
+            print(f"[Worker {proc}] xprof start (step {global_step}) -> {XPROF_DIR}", flush=True)
+
     train_t0 = time.time()
     metrics = train_step(model, optimizer, batch)
     loss_val = float(metrics["loss"])
@@ -1046,6 +1129,12 @@ def run_training_step(global_step: int, epoch: int, epoch_step: int, total_steps
                 step=global_step,
             )
     save_training_checkpoint(global_step, epoch, epoch_step)
+    if XPROF_ENABLE and _xprof_active and global_step >= XPROF_STOP_STEP:
+        import jax.profiler as _jprof
+        _jprof.stop_trace()
+        _xprof_active = False
+        if proc == 0:
+            print(f"[Worker {proc}] xprof stop (step {global_step}) -> {XPROF_DIR}", flush=True)
     return True
 
 # ── Resume from checkpoint ────────────────────────────────
@@ -1239,10 +1328,18 @@ if RUN_FULL_EPOCHS:
         if proc == 0:
             print(f"[Worker {proc}] Finished epoch {epoch}/{NUM_EPOCHS} after {epoch_step - 1} steps", flush=True)
 else:
+    _PROFILE_DIR = os.environ.get("JAX_PROFILE_DIR")
+    _PROFILE_START = int(os.environ.get("JAX_PROFILE_START_STEP", "0"))
+    _PROFILE_STEPS = int(os.environ.get("JAX_PROFILE_STEPS", "0"))
     for step in range(resumed_step + 1, NUM_STEPS + 1):
         global_step = step
+        if _PROFILE_DIR and step == _PROFILE_START:
+            jax.profiler.start_trace(_PROFILE_DIR)
         if not run_training_step(global_step, epoch=0, epoch_step=step, total_steps=NUM_STEPS):
             break
+        if _PROFILE_DIR and _PROFILE_STEPS and step == _PROFILE_START + _PROFILE_STEPS - 1:
+            jax.block_until_ready(step)
+            jax.profiler.stop_trace()
 
 tt = time.time() - t_start
 if CHECKPOINT_ON_FINISH:
