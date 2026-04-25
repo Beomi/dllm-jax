@@ -1,7 +1,7 @@
 # MFU Optimization: Qwen3-8B + DMax OPUT on TPU v5e-64
 
 Summary of a MFU tuning pass on `tpu-v5e-64-eu` (europe-west4-b) for
-`scripts/tpu_v6e_smoke.py` training **Qwen3-8B with full DMax OPUT**
+`scripts/tpu_train.py` training **Qwen3-8B with full DMax OPUT**
 (on_policy_ratio=0.5 rollout kept, block-diffusion attention mask,
 synthetic data, random init, AdamW, aggressive `jax.remat`).
 
@@ -24,7 +24,7 @@ fwd+bwd at `seq=2·MAX_LEN` and — whenever `DMAX_ON_POLICY_RATIO > 0`
 attention term is quadratic, so the true multiplier is **~3.01×** (not
 2×). Under correct accounting the EE measurement is
 **≈ 44% of v5e bf16 peak**, i.e., the compiled graph reaches just under
-half of MXU peak on these shapes. Fixed in `tpu_v6e_smoke.py:319–337`
+half of MXU peak on these shapes. Fixed in `tpu_train.py:319–337`
 (see item 1 below).
 
 ## Optimization ladder (full OPUT semantics preserved)
@@ -39,7 +39,7 @@ half of MXU peak on these shapes. Fixed in `tpu_v6e_smoke.py:319–337`
 
 ### Why each step helped
 
-1. **TP=2 × FSDP=32 mesh** — `tpu_v6e_smoke.py` hard-coded `TP = 8`.
+1. **TP=2 × FSDP=32 mesh** — `tpu_train.py` hard-coded `TP = 8`.
    On v5e-64's 8×8 torus that forces FSDP=8, so optimizer state shards
    only 8-way and B must be a multiple of 8. Dropping TP to 2 (with
    `mesh_utils.create_device_mesh(..., allow_split_physical_axes=True)`
@@ -76,7 +76,7 @@ half of MXU peak on these shapes. Fixed in `tpu_v6e_smoke.py:319–337`
 
 ## Knobs added
 
-All exposed as env vars on `scripts/tpu_v6e_smoke.py`:
+All exposed as env vars on `scripts/tpu_train.py`:
 
 | Env | Default | Effect |
 |--|--|--|
@@ -98,7 +98,7 @@ DMAX_ENABLE=1 DMAX_ON_POLICY_RATIO=0.5 \
 DMAX_NOISE_LOW=0.75 DMAX_NOISE_HIGH=0.75 DMAX_BLOCK_SIZE=32 \
 PEAK_TFLOPS_PER_CHIP=197 \
 NUM_STEPS=0 NUM_EPOCHS=3 WANDB_LOG=1 \
-python3 scripts/tpu_v6e_smoke.py
+python3 scripts/tpu_train.py
 ```
 
 ## What did NOT help
@@ -145,7 +145,7 @@ normally.
 
 ## Code changes (all uncommitted, applied on the TPU)
 
-**`scripts/tpu_v6e_smoke.py`**:
+**`scripts/tpu_train.py`**:
 - Line 87: `TP = int(os.environ.get("TP", "8"))` + split-axes mesh fallback.
 - After flash install: build `_block_diffusion_mask_numpy` once at init,
   wrap in `MultiHeadMask`, construct splash with tuned `BlockSizes`,
@@ -165,7 +165,7 @@ normally.
 In decreasing ROI:
 
 1. ✅ **Fix the DMax MFU formula** — **implemented** in
-   `tpu_v6e_smoke.py:319–337`. The correct multiplier is **~3.01×**,
+   `tpu_train.py:319–337`. The correct multiplier is **~3.01×**,
    not 2×: fwd+bwd at 2L gives dense ×2 and attention ×4 (quadratic),
    and the rollout fwd at 2L (always compiled when
    `DMAX_ON_POLICY_RATIO > 0`) adds another ~0.67× dense and ~1.33×

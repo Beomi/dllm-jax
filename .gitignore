@@ -1,3 +1,5 @@
+.env.*
+!.env.example
 *.lock
 __pycache__/
 *.egg-info/

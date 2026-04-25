@@ -73,9 +73,13 @@ _FLAX_NEW_OPTIMIZER_API = tuple(int(x) for x in _flax_pkg.__version__.split(".")
 try:
     import orbax.checkpoint as ocp
     from orbax.checkpoint import options as ocp_options
+    from orbax.checkpoint import args as ocp_args
+    from orbax.checkpoint import type_handlers as ocp_type_handlers
 except ImportError:
     ocp = None
     ocp_options = None
+    ocp_args = None
+    ocp_type_handlers = None
 
 proc = jax.process_index()
 nproc = jax.process_count()
@@ -144,6 +148,12 @@ def gs_join(base: str, *parts: str) -> str:
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-8B")
 DATASET = os.environ.get("DATASET", "tinystories").lower()
 SYNTHETIC_DATA = DATASET in {"synthetic", "random", "dummy"}
+# SFT datasets use per-example padded batches. Plain pretraining datasets
+# concatenate tokens into a single stream.
+SFT_DATASET = DATASET in {"openthoughts", "open-thoughts", "open-thoughts-114k"}
+# Default: train on the whole chat-templated string (treat it like tinystories).
+# Set SFT_TRAIN_ON_ANSWERS_ONLY=1 to revert to prompt-masked supervision.
+SFT_TRAIN_ON_ANSWERS_ONLY = os.environ.get("SFT_TRAIN_ON_ANSWERS_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
 DATASET_PATH = os.environ.get("DATASET_PATH")
 MODEL_SLUG = path_safe_name(MODEL_NAME.rstrip("/").rsplit("/", 1)[-1]) or "model"
 RUN_NAME = os.environ.get("RUN_NAME") or os.environ.get("WANDB_RUN_NAME") or f"{MODEL_SLUG}-{DATASET}-{int(time.time())}"
@@ -394,7 +404,10 @@ if proc == 0:
 # ── Splash attention for DMax block-diffusion mask ─────────
 # The dense-mask fallback in _attention is ~1.5-2s/step for Qwen3-8B at seq=8192;
 # splash_attention_kernel runs block-sparse flash over the block-diffusion pattern.
-if DMAX_ENABLE:
+# DISABLE_SPLASH_ATTN=1 skips splash install and falls back to dense dot_product_attention
+# with the full block-diffusion mask — slower but a useful isolation for
+# numerics debugging.
+if DMAX_ENABLE and not env_flag("DISABLE_SPLASH_ATTN", False):
     try:
         from jax.experimental.pallas.ops.tpu.splash_attention import (
             splash_attention_mask as _sm,
@@ -543,6 +556,13 @@ else:
     n_loaded = 0
     print(f"[Worker {proc}] LOAD_PRETRAINED=0; using random initialization", flush=True)
 
+# MASK_EMBED_INIT runs POST-shard (see below, right after sharding) so that
+# the .at[].set() peak holds sharded-per-chip copies (~75MB), not replicated
+# copies (~2.4GB × 2 = 4.8GB) which OOM v5e-64's 16GB/chip HBM.
+_mask_init_mode = os.environ.get("MASK_EMBED_INIT", "mean").strip().lower()
+if _mask_init_mode not in {"mean", "mean-embed", "average", "none", "skip", "off", ""}:
+    raise ValueError(f"Unknown MASK_EMBED_INIT={_mask_init_mode!r}")
+
 # ── Shard to 2D mesh ───────────────────────────────────────
 print(f"[Worker {proc}] Sharding to 2D TPU mesh...", flush=True)
 t1 = time.time()
@@ -593,17 +613,59 @@ del gdef, state
 gc.collect()
 print(f"[Worker {proc}] Sharding done in {time.time()-t1:.1f}s (total: {time.time()-t0:.1f}s)", flush=True)
 
+# ── Mask-token embedding warm start (POST-shard) ───────────
+# DMax reuses ``mask_id`` (default vocab_size-1, optionally <|fim_pad|>=151662,
+# etc.) as the MASK token. Untrained vocab rows collapse the noised forward
+# (observed ~step 150 drift to uniform predictions). Seed the mask row with
+# the MEAN of other input/output embedding rows for a sensible "average
+# semantic" warm start. Runs POST-shard so the ``.at[].set()`` doesn't hold
+# two full ~2.4GB replicas in HBM simultaneously.
+if _mask_init_mode in {"mean", "mean-embed", "average"}:
+    _mask_id_local = int(os.environ.get("MASK_TOKEN_ID", str(int(config.vocab_size) - 1)))
+    # On-device compute to respect multi-host sharding — ``jax.device_get`` on
+    # a cross-host sharded jax.Array raises. XLA handles the sharded sum/slice.
+    emb_var = model.embed_tokens.embedding
+    _emb = emb_var.value
+    _sum_rows = jnp.sum(_emb.astype(jnp.float32), axis=0)
+    _mean_row = (_sum_rows - _emb[_mask_id_local].astype(jnp.float32)) / (_emb.shape[0] - 1)
+    emb_var.value = _emb.at[_mask_id_local].set(_mean_row.astype(_emb.dtype))
+    del _emb, _sum_rows, _mean_row
+    gc.collect()
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is not None and hasattr(lm_head, "kernel"):
+        kvar = lm_head.kernel
+        _k = kvar.value
+        _sum_cols = jnp.sum(_k.astype(jnp.float32), axis=1)
+        _mean_col = (_sum_cols - _k[:, _mask_id_local].astype(jnp.float32)) / (_k.shape[1] - 1)
+        kvar.value = _k.at[:, _mask_id_local].set(_mean_col.astype(_k.dtype))
+        del _k, _sum_cols, _mean_col
+        gc.collect()
+    if proc == 0:
+        print(
+            f"[Worker {proc}] MASK_EMBED_INIT=mean (post-shard, on-device): seeded row/col {_mask_id_local}",
+            flush=True,
+        )
+
 # ── Optimizer: AdamW (safer than Adafactor for pretrained MDLM) ──
+# LR_SCHEDULE=cosine with LR_DECAY_STEPS=N decays from PEAK_LR to alpha*PEAK_LR
+# (alpha=LR_DECAY_ALPHA, default 0.1) over N steps after warmup. Default schedule
+# is constant-after-warmup (back-compat with prior runs).
+_lr_schedule_kind = os.environ.get("LR_SCHEDULE", "constant").strip().lower()
+_lr_decay_steps = int(os.environ.get("LR_DECAY_STEPS", "0"))
+_lr_decay_alpha = float(os.environ.get("LR_DECAY_ALPHA", "0.1"))
+if _lr_schedule_kind == "cosine" and _lr_decay_steps > 0:
+    _post_warmup = optax.cosine_decay_schedule(
+        init_value=PEAK_LR, decay_steps=_lr_decay_steps, alpha=_lr_decay_alpha,
+    )
+else:
+    _post_warmup = optax.constant_schedule(PEAK_LR)
 if WARMUP_STEPS > 0:
     lr_schedule = optax.join_schedules(
-        schedules=[
-            optax.linear_schedule(0.0, PEAK_LR, WARMUP_STEPS),
-            optax.constant_schedule(PEAK_LR),
-        ],
+        schedules=[optax.linear_schedule(0.0, PEAK_LR, WARMUP_STEPS), _post_warmup],
         boundaries=[WARMUP_STEPS],
     )
 else:
-    lr_schedule = optax.constant_schedule(PEAK_LR)
+    lr_schedule = _post_warmup
 if OPTIMIZER == "adafactor":
     # Factored optimizer state (~4x less HBM than AdamW) — required to fit
     # 128k context on Qwen3-8B per chip. Loss may climb back after ~step 60
@@ -631,7 +693,11 @@ print(f"[Worker {proc}] Optimizer ready ({OPTIMIZER}, model rebound)", flush=Tru
 # ── MDLM config + tokenizer + data ─────────────────────────
 mdlm_cfg = MDLMConfig(output_dir="/tmp/q3-8b-smoke", max_steps=NUM_STEPS, learning_rate=PEAK_LR)
 alpha_sched = LinearAlphaScheduler()
-mask_id = config.vocab_size - 1
+# MASK_TOKEN_ID overrides the default (vocab_size-1, which is a truly-empty
+# reserved slot on Qwen3 with an untrained embedding). Set to a pretrained
+# Qwen3 special token like 151662 (<|fim_pad|>) to inherit useful "fill in
+# the missing piece" semantics for the denoising task.
+mask_id = int(os.environ.get("MASK_TOKEN_ID", str(config.vocab_size - 1)))
 
 print(f"[Worker {proc}] Loading tokenizer + dataset stream...", flush=True)
 tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -649,6 +715,8 @@ if not SYNTHETIC_DATA:
             ds = load_dataset("parquet", data_files=parquet_files, split="train", streaming=True)
         elif DATASET == "wikipedia":
             ds = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
+        elif SFT_DATASET:
+            ds = load_dataset("open-thoughts/OpenThoughts-114k", "default", split="train", streaming=True)
         else:
             ds = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
         return iter(ds)
@@ -664,20 +732,130 @@ def refill_buffer(needed):
     exhausted = False
     while len(token_buffer) < needed:
         try:
-            text = next(ds_iter)["text"]
+            row = next(ds_iter)
         except StopIteration:
             exhausted = True
             break
+        if SFT_DATASET:
+            ids = _sft_row_to_tokens(row)
+            if ids is None:
+                continue
+            token_buffer.extend(ids)
+        else:
+            token_buffer.extend(tokenizer.encode(row["text"], add_special_tokens=False))
         # Append EOS between docs so the model sees document boundaries.
-        token_buffer.extend(tokenizer.encode(text, add_special_tokens=False))
         token_buffer.append(eos_id)
     return not exhausted
+
+
+# SFT pipeline:
+#   SFT_TRAIN_ON_ANSWERS_ONLY=0 (default, full-text): tokens go through
+#       ``_sft_row_to_tokens`` and are concat-packed by ``refill_buffer`` just
+#       like tinystories (no row dropping, no truncation — every chat-templated
+#       token is trained on).
+#   SFT_TRAIN_ON_ANSWERS_ONLY=1 (answer-only): per-example padded batch via
+#       ``_sft_batch`` + ``_tokenize_sft_row`` because packing can't preserve
+#       the prompt/answer boundary needed for the -100 label mask.
+_ROLE_MAP = {"human": "user", "gpt": "assistant", "system": "system", "user": "user", "assistant": "assistant"}
+_sft_dropped = 0
+_sft_kept = 0
+
+
+def _sft_row_to_messages(row):
+    convs = row.get("conversations")
+    if not convs:
+        return None
+    messages = []
+    system = row.get("system")
+    if system:
+        messages.append({"role": "system", "content": system})
+    for c in convs:
+        if isinstance(c, dict) and "from" in c:
+            messages.append({"role": _ROLE_MAP.get(c["from"], c["from"]), "content": c["value"]})
+        else:
+            messages.append(c)
+    return messages
+
+
+def _sft_row_to_tokens(row):
+    """Tokenize an SFT row via chat template. Used by the concat-pack pipeline.
+    Returns token ids (no length filter — packing handles arbitrary lengths)."""
+    messages = _sft_row_to_messages(row)
+    if messages is None:
+        return None
+    out = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=False, return_dict=True,
+    )
+    return out["input_ids"]
+
+
+def _tokenize_sft_row(row):
+    """Answer-only path: returns (input_ids, labels) of length ≤ MAX_LEN or
+    None to skip. Only called when SFT_TRAIN_ON_ANSWERS_ONLY=1."""
+    messages = _sft_row_to_messages(row)
+    if messages is None:
+        return None
+    full_out = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=False, return_dict=True,
+    )
+    full_ids = full_out["input_ids"]
+    if len(full_ids) > MAX_LEN:
+        return None
+    # Prompt = everything except the final assistant turn; assistant supervision
+    # starts at prompt_len. Works for 1-user-1-assistant (OpenThoughts shape).
+    if len(messages) >= 2 and messages[-1]["role"] == "assistant":
+        prompt_msgs = messages[:-1]
+    else:
+        prompt_msgs = messages
+    prompt_out = tokenizer.apply_chat_template(
+        prompt_msgs, tokenize=True, add_generation_prompt=True, return_dict=True,
+    )
+    prompt_len = min(len(prompt_out["input_ids"]), len(full_ids))
+    labels = list(full_ids)
+    for i in range(prompt_len):
+        labels[i] = -100
+    return full_ids, labels
+
+
+def _sft_batch():
+    global _sft_dropped, _sft_kept
+    ids = np.full((GLOBAL_BATCH, MAX_LEN), tokenizer.pad_token_id, dtype=np.int64)
+    labels = np.full((GLOBAL_BATCH, MAX_LEN), -100, dtype=np.int64)
+    filled = 0
+    while filled < GLOBAL_BATCH:
+        try:
+            row = next(ds_iter)
+        except StopIteration:
+            if filled == 0:
+                return None
+            break
+        tok = _tokenize_sft_row(row)
+        if tok is None:
+            _sft_dropped += 1
+            continue
+        row_ids, row_labels = tok
+        L = len(row_ids)
+        ids[filled, :L] = row_ids
+        labels[filled, :L] = row_labels
+        filled += 1
+        _sft_kept += 1
+    # Pad unfilled rows (end of stream) with a duplicate of row 0 to keep shape.
+    for i in range(filled, GLOBAL_BATCH):
+        ids[i] = ids[0]
+        labels[i] = labels[0]
+    return {"input_ids": ids, "labels": labels}
+
 
 def get_batch():
     global token_buffer
     if SYNTHETIC_DATA:
         ids = synthetic_rng.integers(0, max(2, mask_id), size=(GLOBAL_BATCH, MAX_LEN), dtype=np.int64)
         return {"input_ids": ids, "labels": ids.copy()}
+    # Answer-only needs per-example padded batches (to preserve the -100 mask).
+    # Full-text SFT (default) concat-packs through ``refill_buffer`` below,
+    # reaching full MAX_LEN utilization with no row dropping.
+    if SFT_DATASET and SFT_TRAIN_ON_ANSWERS_ONLY:
+        return _sft_batch()
     refill_buffer(GLOBAL_BATCH * MAX_LEN)
     if not token_buffer:
         return None
@@ -1232,22 +1410,64 @@ if RESUME_DIR:
         print(f"[Worker {proc}] Restoring checkpoint: {ckpt_path}", flush=True)
 
     _resume_rng_placeholder = np.asarray(jax.random.key_data(jax.random.key(0)))
+    _resume_restore_optimizer = env_flag("RESUME_RESTORE_OPTIMIZER", True)
     restore_target = {
         "model": nnx.state(model),
-        "optimizer": nnx.state(optimizer),
         "global_step": np.asarray(0, dtype=np.int64),
         "epoch": np.asarray(0, dtype=np.int32),
         "epoch_step": np.asarray(0, dtype=np.int64),
         "total_tokens": np.asarray(0, dtype=np.int64),
         "rng": _resume_rng_placeholder,
     }
+    if _resume_restore_optimizer:
+        restore_target["optimizer"] = nnx.state(optimizer)
 
     # Use orbax directly for GCS restore (flax's restore_checkpoint can't list GCS dirs)
     resume_ckpt = make_orbax_checkpointer()
     if proc == 0:
         print(f"[Worker {proc}] Starting orbax restore...", flush=True)
     with orbax_set_mesh_context_patch():
-        restored = resume_ckpt.restore(ckpt_path, target=restore_target)
+        if not _resume_restore_optimizer and ocp_args is not None and ocp_type_handlers is not None:
+            # Model-only restore: use PyTreeRestore(partial_restore=True) so the
+            # checkpoint's optimizer state (different shape / optimizer family)
+            # is simply ignored.
+            def _to_restore_args(x):
+                if isinstance(x, jax.Array):
+                    return ocp_type_handlers.ArrayRestoreArgs(
+                        restore_type=jax.Array,
+                        dtype=x.dtype,
+                        sharding=x.sharding,
+                        global_shape=x.shape,
+                    )
+                if isinstance(x, (jnp.ndarray, np.ndarray)):
+                    arr = np.asarray(x)
+                    return ocp_type_handlers.RestoreArgs(restore_type=np.ndarray, dtype=arr.dtype)
+                return ocp_type_handlers.RestoreArgs()
+
+            restore_args_tree = jax.tree_util.tree_map(
+                _to_restore_args,
+                restore_target,
+                is_leaf=lambda x: isinstance(x, (jax.Array, jnp.ndarray, np.ndarray)),
+            )
+            pytree_ckpt = (
+                ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
+                if ocp_options is None
+                else ocp.Checkpointer(
+                    ocp.PyTreeCheckpointHandler(
+                        multiprocessing_options=ocp_options.MultiprocessingOptions(primary_host=0)
+                    )
+                )
+            )
+            restored = pytree_ckpt.restore(
+                ckpt_path,
+                args=ocp_args.PyTreeRestore(
+                    item=restore_target,
+                    restore_args=restore_args_tree,
+                    partial_restore=True,
+                ),
+            )
+        else:
+            restored = resume_ckpt.restore(ckpt_path, target=restore_target)
     if proc == 0:
         print(f"[Worker {proc}] Orbax restore done, re-sharding...", flush=True)
 
@@ -1321,16 +1541,45 @@ if RESUME_DIR:
     restored_model_state = reshard_tree(restored["model"], "resume-model")
     model = nnx.merge(gdef, restored_model_state)
 
-    opt_gdef, _ = nnx.split(optimizer)
-    restored_opt_state = reshard_tree(restored["optimizer"], "resume-optimizer")
-    optimizer = nnx.merge(opt_gdef, restored_opt_state)
-    model = optimizer.model  # rebind after merge
+    if _resume_restore_optimizer:
+        opt_gdef, _ = nnx.split(optimizer)
+        restored_opt_state = reshard_tree(restored["optimizer"], "resume-optimizer")
+        optimizer = nnx.merge(opt_gdef, restored_opt_state)
+        model = optimizer.model  # rebind after merge
+    else:
+        if proc == 0:
+            print(
+                f"[Worker {proc}] RESUME_RESTORE_OPTIMIZER=0: keeping fresh "
+                f"{OPTIMIZER} optimizer state (ignoring checkpoint's optimizer)",
+                flush=True,
+            )
+        opt_gdef, opt_state = nnx.split(optimizer)
+        optimizer = nnx.merge(opt_gdef, opt_state)
+        model = optimizer.model  # rebind
 
-    resumed_step = int(restored["global_step"])
-    resumed_epoch = int(restored["epoch"])
-    resumed_epoch_step = int(restored["epoch_step"])
-    total_tokens = int(restored["total_tokens"])
-    rng = jax.random.wrap_key_data(restored["rng"])
+    # RESUME_RESET_STEP=1 zeroes the step/epoch counters after loading weights.
+    # Use when continuing onto a different dataset (e.g. pretrained checkpoint →
+    # SFT) so the training budget (NUM_STEPS / NUM_EPOCHS) starts from scratch.
+    _resume_reset_step = env_flag("RESUME_RESET_STEP", False)
+    if _resume_reset_step:
+        if proc == 0:
+            print(
+                f"[Worker {proc}] RESUME_RESET_STEP=1: ignoring checkpoint step "
+                f"{int(restored['global_step'])}/epoch {int(restored['epoch'])} "
+                "and starting training from step 0",
+                flush=True,
+            )
+        resumed_step = 0
+        resumed_epoch = 0
+        resumed_epoch_step = 0
+        total_tokens = 0
+        rng = jax.random.key(42)
+    else:
+        resumed_step = int(restored["global_step"])
+        resumed_epoch = int(restored["epoch"])
+        resumed_epoch_step = int(restored["epoch_step"])
+        total_tokens = int(restored["total_tokens"])
+        rng = jax.random.wrap_key_data(restored["rng"])
 
     del restored, restore_target, _resume_rng_placeholder
     gc.collect()
