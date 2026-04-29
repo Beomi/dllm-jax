@@ -222,7 +222,7 @@ and identical `updated_block` at every step (modulo float32 rounding in attentio
 
 1. Add `past_k/past_v/cache_position` plumbing to model with no-op default.
 2. Implement `dmax_generate_spd_kv_fast` + post-block hard-write pass.
-3. Add `INFER_IMPL=kv_fast` to `tpu_dmax_infer_checkpoint.py`.
+3. Add `INFER_IMPL=kv_fast` to `tpu_infer.py`.
 4. A/B test: `kv_fast` vs `fast` on the same prompt/settings. Compare text and `nfe`.
 5. Benchmark: measure `generate_seconds` at `gen_length=128, 1024, 4096`. Expect
    3–5× speedup on longer contexts.

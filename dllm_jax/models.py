@@ -11,6 +11,7 @@ import math
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.ad_checkpoint import checkpoint_name
 import transformers
 
 # Compatibility: flax >= 0.11 has nnx.List; older versions use plain list()
@@ -19,6 +20,11 @@ _nnx_list = getattr(nnx, "List", list)
 # Flash attention hook: set by training script to a shard_map-wrapped Pallas kernel.
 # Signature: _FLASH_ATTN_FN(q, k, v, sm_scale) with layout (batch, heads, seq, dim).
 _FLASH_ATTN_FN = None
+
+# Masked flash hook: set by training script for block-diffusion / other sparse masks.
+# Signature: _MASKED_FLASH_ATTN_FN(q, k, v, sm_scale) with same layout — mask baked in.
+# Used when attention_mask is passed (so dense attention would otherwise run).
+_MASKED_FLASH_ATTN_FN = None
 
 
 def get_dtype(name: str):
@@ -290,7 +296,9 @@ class DenseMLP(nnx.Module):
 
     def __call__(self, hidden_states):
         if self.gated:
-            return self.down_proj(self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
+            gate_up = self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+            gate_up = checkpoint_name(gate_up, "gate_up")
+            return self.down_proj(gate_up)
         return self.fc2(self.act(self.fc1(hidden_states)))
 
 
@@ -355,6 +363,9 @@ class SelfAttention(nnx.Module):
             k = self.k_norm(k)
         cos, sin = build_rope(position_ids, self.rotary_dim, self.rope_theta, q.dtype)
         q, k = apply_rope(q, k, cos, sin, self.rotary_dim)
+        q = checkpoint_name(q, "q")
+        k = checkpoint_name(k, "k")
+        v = checkpoint_name(v, "v")
         return q, k, v
 
     def _attention(self, q, k, v, attention_mask):
@@ -366,6 +377,11 @@ class SelfAttention(nnx.Module):
             v = jnp.repeat(v, repeats, axis=2)
         if _FLASH_ATTN_FN is not None and attention_mask is None:
             output = _FLASH_ATTN_FN(
+                q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3),
+                1.0 / math.sqrt(self.head_dim),
+            ).transpose(0, 2, 1, 3).reshape(batch_size, query_len, self.num_heads * self.head_dim)
+        elif _MASKED_FLASH_ATTN_FN is not None and attention_mask is not None:
+            output = _MASKED_FLASH_ATTN_FN(
                 q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3),
                 1.0 / math.sqrt(self.head_dim),
             ).transpose(0, 2, 1, 3).reshape(batch_size, query_len, self.num_heads * self.head_dim)

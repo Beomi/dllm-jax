@@ -36,16 +36,17 @@ def _hf_download(model_name: str, verbose: bool = True) -> str:
         print(f"[Worker {proc}] Running: {' '.join(cmd)}", flush=True)
 
     result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    if result.returncode != 0:
-        if verbose and proc == 0:
-            print(f"[Worker {proc}] hf CLI failed (rc={result.returncode}), falling back to snapshot_download", flush=True)
-            print(f"[Worker {proc}] stderr: {result.stderr[:200]}", flush=True)
-        from huggingface_hub import snapshot_download
-        return snapshot_download(
-            model_name,
-            allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
-        )
-    return result.stdout.strip().split("\n")[-1]
+    # Modern ``hf download`` (huggingface_hub>=0.25) decorates the final path
+    # line with a ``path:`` label and can emit progress lines; prefer the
+    # library call to get a clean local_dir path back.
+    from huggingface_hub import snapshot_download
+    if result.returncode != 0 and verbose and proc == 0:
+        print(f"[Worker {proc}] hf CLI failed (rc={result.returncode})", flush=True)
+        print(f"[Worker {proc}] stderr: {result.stderr[:200]}", flush=True)
+    return snapshot_download(
+        model_name,
+        allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+    )
 
 
 def load_pretrained_weights(

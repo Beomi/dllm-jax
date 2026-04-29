@@ -364,6 +364,19 @@ def main() -> None:
 
     model_name = os.environ.get("MODEL_NAME", "Qwen/Qwen3-8B")
     prompt = os.environ.get("PROMPT", "Once upon a time")
+    # PROMPTS_FILE (one prompt per line) overrides PROMPT and runs generation
+    # for each prompt against the same restored model. Blank lines skipped;
+    # lines starting with # are treated as comments and also skipped.
+    prompts_file = os.environ.get("PROMPTS_FILE", "").strip()
+    if prompts_file:
+        with open(prompts_file) as f:
+            prompts_list = [
+                ln.rstrip("\n") for ln in f if ln.strip() and not ln.lstrip().startswith("#")
+            ]
+        if not prompts_list:
+            raise ValueError(f"PROMPTS_FILE={prompts_file} produced no usable prompts")
+    else:
+        prompts_list = [prompt]
     gen_length = int(os.environ.get("GEN_LENGTH", "32"))
     block_length = int(os.environ.get("BLOCK_LENGTH", "32"))
     steps = int(os.environ.get("STEPS", "8"))
@@ -374,6 +387,8 @@ def main() -> None:
     fast_bucket_length = int(os.environ.get("FAST_BUCKET_LENGTH", "4096"))
     temperature = float(os.environ.get("TEMPERATURE", "0.0"))
     top_k = int(os.environ.get("TOP_K", "1"))
+    warmup_runs = max(0, int(os.environ.get("WARMUP_RUNS", "0")))
+    measured_runs = max(1, int(os.environ.get("MEASURED_RUNS", "1")))
     seed_env = os.environ.get("SEED")
     seed = int(seed_env) if seed_env else None
     dtype_name = os.environ.get("DTYPE", "bfloat16")
@@ -470,9 +485,19 @@ def main() -> None:
     restored_epoch_step = int(np.asarray(multihost_utils.process_allgather(restored["epoch_step"], tiled=False))[0])
     sync_all("infer-restore-complete")
 
-    input_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-    input_arr = np.asarray([input_ids], dtype=np.int32)
-    input_arr = jax.device_put(input_arr, NamedSharding(mesh, P()))
+    # For multi-prompt runs, tokenize all upfront. Pad to the max so every
+    # call has the same input shape and only one compile happens.
+    tokenized = [tokenizer(p, add_special_tokens=False)["input_ids"] for p in prompts_list]
+    max_prompt_len = max(len(ids) for ids in tokenized)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    padded = [
+        (ids + [pad_id] * (max_prompt_len - len(ids))) for ids in tokenized
+    ]
+    prompt_lengths = [len(ids) for ids in tokenized]  # original (unpadded) length per prompt
+    input_arr_full = np.asarray(padded, dtype=np.int32)  # [num_prompts, max_len]
+    input_ids = tokenized[0]  # for the first-prompt log line
+    # Device-place the first prompt's input array for the compile-path unchanged below.
+    input_arr = jax.device_put(input_arr_full[:1], NamedSharding(mesh, P()))
 
     if proc == 0:
         print(
@@ -513,22 +538,82 @@ def main() -> None:
         generate_kwargs["bucket_length"] = fast_bucket_length
     # kv_fast does not use bucket_length (it runs a single compiled while_loop
     # over blocks with a pre-allocated KV cache of size ``total_length``).
-    output = generate_fn(model, input_arr, **generate_kwargs)
-    output.generated_tokens.block_until_ready()
-    nfe = int(np.asarray(output.nfe))
-    generated_all = np.asarray(multihost_utils.process_allgather(output.generated_tokens, tiled=False))
-    sync_all("infer-generation-complete")
+
+    # TEMPS env var lets one process run multiple temperatures sharing the
+    # same restored model. Example: TEMPS="0.0,0.3,0.5,0.7,1.0"
+    temps_env = os.environ.get("TEMPS", "").strip()
+    if temps_env:
+        temps_list = [float(t) for t in temps_env.split(",") if t.strip()]
+    else:
+        temps_list = [temperature]
+
+    def _run_once(tag: str, temp_val: float, seed_val):
+        local_kwargs = dict(generate_kwargs)
+        local_kwargs["temperature"] = temp_val
+        local_kwargs["seed"] = seed_val
+        rt0 = time.time()
+        output = generate_fn(model, input_arr, **local_kwargs)
+        output.generated_tokens.block_until_ready()
+        dt = time.time() - rt0
+        nfe_val = int(np.asarray(output.nfe))
+        if proc == 0:
+            print(f"[bench] {tag} temp={temp_val} generate_seconds={dt:.2f} nfe={nfe_val}", flush=True)
+        sync_all(f"infer-{tag}")
+        return output, dt, nfe_val
+
+    all_results = []  # list of (prompt_idx, prompt_str, temp_result_dict)
+    for p_idx, p_text in enumerate(prompts_list):
+        # Swap input_arr to this prompt's padded tokens (same shape → no recompile).
+        input_arr = jax.device_put(input_arr_full[p_idx:p_idx + 1], NamedSharding(mesh, P()))
+        for t_idx, temp_val in enumerate(temps_list):
+            for i in range(warmup_runs):
+                _run_once(f"warmup[p{p_idx}_temp={temp_val},{i + 1}/{warmup_runs}]", temp_val, seed)
+
+            measured_times = []
+            measured_nfe = []
+            output = None
+            for i in range(measured_runs):
+                output, dt, nfe_val = _run_once(
+                    f"measured[p{p_idx}_temp={temp_val},{i + 1}/{measured_runs}]", temp_val, seed,
+                )
+                measured_times.append(dt)
+                measured_nfe.append(nfe_val)
+
+            generated_all = np.asarray(multihost_utils.process_allgather(output.generated_tokens, tiled=False))
+            sync_all(f"infer-generation-complete-p{p_idx}-temp{t_idx}")
+            if proc == 0:
+                generated = generated_all[0, 0].tolist() if generated_all.ndim == 3 else generated_all[0].tolist()
+                median_dt = sorted(measured_times)[len(measured_times) // 2]
+                tok_per_s = gen_length / median_dt if median_dt > 0 else float("nan")
+                all_results.append((
+                    p_idx, p_text,
+                    {
+                        "temperature": temp_val,
+                        "seed": seed,
+                        "nfe": measured_nfe[-1],
+                        "gen_tokens": len(generated),
+                        "median_s": median_dt,
+                        "tok_per_s": tok_per_s,
+                        "text": tokenizer.decode(generated, skip_special_tokens=True),
+                    },
+                ))
 
     if proc == 0:
-        generated = generated_all[0, 0].tolist() if generated_all.ndim == 3 else generated_all[0].tolist()
-        print("=" * 70)
+        print("\n" + "=" * 70)
         print(f"checkpoint_step={restored_step} epoch={restored_epoch} epoch_step={restored_epoch_step}")
-        print(f"prompt={prompt!r}")
-        print("generated:")
-        print(tokenizer.decode(generated, skip_special_tokens=True))
-        print(f"nfe={nfe} generated_tokens={len(generated)}")
-        print(f"restore_plus_generate_seconds={time.time() - t0:.1f}")
-        print(f"generate_seconds={time.time() - tg:.1f}")
+        for p_idx, p_text, r in all_results:
+            print("=" * 70)
+            print(f"[prompt {p_idx + 1}/{len(prompts_list)}] {p_text!r}")
+            print("-" * 70)
+            print(
+                f"temp={r['temperature']} seed={r['seed']} "
+                f"nfe={r['nfe']} gen_tokens={r['gen_tokens']} "
+                f"median={r['median_s']:.2f}s tok_per_s={r['tok_per_s']:.1f}"
+            )
+            print("generated:")
+            print(r["text"])
+        print("=" * 70)
+        print(f"restore_plus_all_generate_seconds={time.time() - t0:.1f}")
         print("=" * 70, flush=True)
 
 

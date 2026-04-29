@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +11,174 @@ import jax.numpy as jnp
 from flax import nnx
 
 from dllm_jax.trainers import resolve_mask_token_id
+
+
+def _resolve_kv_cache_dtype(model: Any):
+    """Pick the KV-cache dtype for kv_fast inference.
+
+    Default: the model's compute dtype (bf16) — cuts cache HBM in half and
+    lets ``jax.nn.dot_product_attention`` run at bf16 MXU throughput.
+    ``INFER_KV_DTYPE=fp32`` restores the previous float32 cache (matches the
+    qk_norm-upcast precision path; slightly more accurate, ~2× slower attn).
+    """
+    choice = os.environ.get("INFER_KV_DTYPE", "bf16").strip().lower()
+    if choice in {"fp32", "float32", "f32"}:
+        return jnp.float32
+    compute_name = getattr(model, "dtype_name", "bfloat16")
+    if compute_name == "float32":
+        return jnp.float32
+    if compute_name == "float16":
+        return jnp.float16
+    return jnp.bfloat16
+
+
+def _infer_mesh_from_model(model: Any):
+    """Return the NamedSharding mesh used by ``model`` params, or None.
+
+    Walks ``nnx.state(model)`` leaves, unwrapping nnx.Variable objects to their
+    underlying jax.Array so ``.sharding.mesh`` is accessible.
+    """
+    try:
+        state = nnx.state(model)
+    except Exception:
+        state = model
+
+    for leaf in jax.tree_util.tree_leaves(state):
+        value = getattr(leaf, "value", leaf)
+        if isinstance(value, jax.Array):
+            sharding = getattr(value, "sharding", None)
+            mesh = getattr(sharding, "mesh", None) if sharding is not None else None
+            if mesh is not None and getattr(mesh, "shape", None):
+                return mesh
+    return None
+
+
+def install_block_causal_splash_for_inference(
+    mesh: Any,
+    num_heads: int,
+    total_length: int,
+    block_length: int,
+    *,
+    splash_block: int | None = None,
+):
+    """Register a splash_attention kernel as ``dllm_jax.models._MASKED_FLASH_ATTN_FN``.
+
+    The kernel targets the block-causal mask shape produced by
+    ``create_block_causal_attention_mask(total_length, block_length)`` — i.e.
+    block N attends fully to all blocks [0, N]. Intended for the fixed-shape
+    ``dmax_generate_spd_fast`` path; no backward pass is compiled.
+
+    Mesh is expected to have axis names ``fsdp`` and ``tp`` (matches the
+    training and inference scripts in this repo); heads shard along ``tp``.
+    """
+    import numpy as np
+    from jax.experimental.pallas.ops.tpu.splash_attention import (
+        splash_attention_mask as _sm,
+        splash_attention_kernel as _sk,
+    )
+    from jax.experimental.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+
+    from dllm_jax import models as _models
+
+    tp = int(mesh.shape.get("tp", 1)) if hasattr(mesh, "shape") else 1
+    heads_per_tp = max(1, num_heads // tp)
+
+    idx = np.arange(total_length)
+    block_q = idx[:, None] // block_length
+    block_kv = idx[None, :] // block_length
+    mask_np = (block_q >= block_kv).astype(np.bool_)
+
+    splash_mask = _sm.MultiHeadMask(masks=[_sm.NumpyMask(mask_np)] * heads_per_tp)
+    requested_bs = int(splash_block) if splash_block is not None else int(
+        os.environ.get("INFER_SPLASH_BLOCK", "512")
+    )
+    # Splash on TPU requires block_q/block_kv both divide total_length AND be
+    # multiples of 128 (MXU lane width). Find the largest such value ≤ request.
+    NUM_LANES = 128
+    bs = requested_bs - (requested_bs % NUM_LANES) if requested_bs >= NUM_LANES else NUM_LANES
+    while bs > NUM_LANES and (total_length % bs != 0 or bs % NUM_LANES != 0):
+        bs -= NUM_LANES
+    if bs < NUM_LANES or total_length % bs != 0:
+        raise ValueError(
+            f"splash install: no block size ≤ {requested_bs} that is a multiple "
+            f"of {NUM_LANES} and divides total_length={total_length}"
+        )
+    if bs != requested_bs:
+        print(
+            f"[dmax] INFER_SPLASH_BLOCK={requested_bs} → using block={bs} "
+            f"(largest multiple of {NUM_LANES} dividing total_length={total_length})",
+            flush=True,
+        )
+    block_sizes = _sk.BlockSizes(
+        block_q=bs, block_kv=bs, block_kv_compute=bs,
+    )
+    splash_fn = _sk.make_splash_mha_single_device(
+        mask=splash_mask, block_sizes=block_sizes,
+    )
+
+    def _per_shard(q, k, v, sm_scale):
+        q_scaled = (q * sm_scale).astype(q.dtype)
+        return jax.vmap(splash_fn)(q_scaled, k, v)
+
+    # Inference typically runs batch=1; sharding the batch axis across ``fsdp``
+    # would require batch >= fsdp. Replicate on batch, shard heads on ``tp``.
+    _batch_spec = None
+    in_specs = (P(_batch_spec, "tp", None, None),) * 3
+    out_specs = P(_batch_spec, "tp", None, None)
+
+    def _sharded_masked_flash(q, k, v, sm_scale):
+        return shard_map(
+            lambda q_, k_, v_: _per_shard(q_, k_, v_, sm_scale),
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_rep=False,
+        )(q, k, v)
+
+    _models._MASKED_FLASH_ATTN_FN = _sharded_masked_flash
+    print(
+        f"[dmax] splash installed for block-causal inference: "
+        f"mask {mask_np.shape} heads_per_tp={heads_per_tp} tp={tp} block={bs}",
+        flush=True,
+    )
+    return _sharded_masked_flash
+
+
+def _env_true(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _try_autoinstall_block_causal_splash(model: Any, total_length: int, block_length: int):
+    """Gated by ``INFER_SPLASH=1``. Installs splash if a mesh can be inferred.
+
+    Returns the installed kernel on success, None on skip/failure. A failure
+    leaves the existing ``_MASKED_FLASH_ATTN_FN`` untouched so the caller
+    silently falls back to dense attention.
+    """
+    if not _env_true("INFER_SPLASH"):
+        return None
+    try:
+        mesh = _infer_mesh_from_model(model)
+        if mesh is None:
+            print(
+                "[dmax] INFER_SPLASH=1 but no mesh could be inferred from model; "
+                "falling back to dense attention",
+                flush=True,
+            )
+            return None
+        num_heads = int(model.spec.num_attention_heads)
+        return install_block_causal_splash_for_inference(
+            mesh, num_heads, total_length, block_length,
+        )
+    except Exception as exc:  # pragma: no cover — best-effort runtime install
+        import traceback
+        print(
+            f"[dmax] INFER_SPLASH=1 requested but splash install failed, "
+            f"falling back to dense attention: {exc}\n{traceback.format_exc()}",
+            flush=True,
+        )
+        return None
 
 
 @dataclass
@@ -282,6 +451,13 @@ def dmax_generate_spd_fast(
     gen_length = int(gen_length)
     batch_size, prompt_length = input_ids.shape
     num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
+    # Splash attention wants total_length % 128 == 0 (TPU MXU lane alignment).
+    # With block_length=32 that means num_blocks must be a multiple of 4. Pad
+    # up when INFER_SPLASH=1 — the extra blocks add compute but are correct.
+    if _env_true("INFER_SPLASH"):
+        align_blocks = max(1, 128 // max(1, block_length))
+        if align_blocks > 1 and num_blocks % align_blocks != 0:
+            num_blocks += align_blocks - (num_blocks % align_blocks)
     total_length = num_blocks * block_length
     new_gen_length = total_length - prompt_length
     prefill_blocks = prompt_length // block_length
@@ -537,6 +713,11 @@ def dmax_generate_spd_fast(
 
     attention_mask = create_block_causal_attention_mask(total_length, block_length)
     position_ids = jnp.broadcast_to(jnp.arange(total_length)[None, :], (batch_size, total_length))
+
+    # Opt-in splash kernel for the dense block-causal attention that this path
+    # normally runs through ``jax.nn.dot_product_attention``. See
+    # ``install_block_causal_splash_for_inference`` and the INFER_SPLASH env.
+    _try_autoinstall_block_causal_splash(model, total_length, block_length)
 
     @nnx.jit
     def generate_fixed_shape(current_model, prompt_ids):
@@ -1098,13 +1279,11 @@ def dmax_generate_spd_kv_fast(
             mask_embedding.astype(jnp.float32), axis=-1, keepdims=True
         )
 
-        # K/V cache stored in float32 to match the QK-norm precision path that
-        # the non-cached ``fast`` attention uses: for models with ``qk_norm``
-        # (e.g. Qwen3) ``nnx.RMSNorm`` upcasts to float32, and
-        # ``jax.nn.dot_product_attention`` requires Q, K, V to all share dtype.
-        # V is upcast from the model's compute dtype (bf16) to float32 when
-        # written, which is exact.
-        cache_dtype = jnp.float32
+        # KV cache dtype: default = model compute dtype (bf16) for ~2× HBM
+        # savings and bf16 attention throughput. Set INFER_KV_DTYPE=fp32 to
+        # fall back to float32 — matches the pre-bf16 precision path (qk_norm
+        # upcast to f32 preserved through attention).
+        cache_dtype = _resolve_kv_cache_dtype(current_model)
 
         past_kv = [
             (
